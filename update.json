@@ -2,6 +2,6 @@
   "version": 3,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
   "notes": "Update panel is now platform-specific: Android checks the APK, PC checks addon.js",
-  "apkVersion": 3,
+  "apkVersion": 4,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
