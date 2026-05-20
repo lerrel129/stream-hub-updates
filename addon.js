@@ -12,17 +12,17 @@ const TMDB_API_KEY = "6886604aa36c09e80400a8732d061684";
 const CONFIG_PATH = path.join(__dirname, "config.json");
 
 // ============ OTA UPDATE ============
-// Verzia tohto kodu. ZVYS toto cislo pri kazdom novom vydani
-// (a rovnake cislo daj do "version" v update.json na GitHube).
+// Version of this code. INCREASE this number for every new release
+// (and put the same number into "version" in update.json on GitHub).
 const APP_VERSION = 1;
-// Raw odkaz na update.json v GitHub repozitari (lerrel129/stream-hub-updates).
+// Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
-// Kod, ktorym sa proces ukonci po stiahnuti aktualizacie -
-// obal (desktop/android) podla neho restartuje appku.
+// Exit code used when the process terminates after downloading an update -
+// the wrapper (desktop/android) restarts the app based on it.
 const UPDATE_EXIT_CODE = 87;
-// Verzia nativneho obalu (APK versionCode). Android obal ju posiela
-// ako process.argv[2]. Na PC zostava 0 (APK aktualizacia sa netyka PC).
+// Version of the native wrapper (APK versionCode). The Android wrapper
+// passes it as process.argv[2]. On PC it stays 0 (APK update is PC-irrelevant).
 const NATIVE_VERSION = parseInt(process.argv[2]) || 0;
 
 // ============ CONFIG ============
@@ -1018,7 +1018,7 @@ function startProxyServer() {
                     latest,
                     updateAvailable: latest > APP_VERSION,
                     notes: m.notes || "",
-                    // Plna APK aktualizacia (len Android)
+                    // Full APK update (Android only)
                     apkUrl: m.apkUrl || "",
                     apkVersion,
                     nativeVersion: NATIVE_VERSION,
@@ -1054,20 +1054,20 @@ function startProxyServer() {
                     headers: { "Cache-Control": "no-cache" },
                 });
                 const newCode = typeof dl.data === "string" ? dl.data : String(dl.data);
-                // Overenie ze stiahnuty subor je naozaj addon.js (nie napr. 404 stranka)
+                // Verify the downloaded file really is addon.js (not e.g. a 404 page)
                 if (dl.status !== 200 || newCode.length < 5000 ||
                     !newCode.includes("startAddonServer") || !newCode.includes("APP_VERSION")) {
                     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                     res.end(JSON.stringify({ ok: false, error: "Stiahnutý súbor nie je platný addon.js" }));
                     return;
                 }
-                // Zaloha povodneho suboru + zapis noveho
+                // Back up the original file + write the new one
                 try { fs.writeFileSync(__filename + ".bak", fs.readFileSync(__filename)); } catch (e) {}
                 fs.writeFileSync(__filename, newCode, "utf8");
                 console.log(`[UPDATE] Nainštalovaná verzia ${latest}, reštartujem...`);
                 res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                 res.end(JSON.stringify({ ok: true, version: latest }));
-                // Ukonci proces - obal appku restartuje s novym kodom
+                // Exit the process - the wrapper restarts the app with the new code
                 setTimeout(() => process.exit(UPDATE_EXIT_CODE), 1200);
             } catch (e) {
                 res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -1731,7 +1731,7 @@ async function updateAction() {
     const st = document.getElementById("updStatus");
 
     if (updateState === "available") {
-        // Stiahnut a nainstalovat
+        // Download and install
         btn.disabled = true;
         st.textContent = t("updDownloading");
         try {
@@ -1739,7 +1739,7 @@ async function updateAction() {
             const d = await r.json();
             if (d.ok) {
                 st.textContent = t("updRestarting");
-                // appka sa sama restartuje s novym kodom
+                // the app restarts itself with the new code
             } else {
                 st.textContent = (d.error || t("updError"));
                 btn.disabled = false;
@@ -1751,7 +1751,7 @@ async function updateAction() {
         return;
     }
 
-    // Skontrolovat
+    // Check
     btn.disabled = true;
     st.textContent = t("updChecking");
     try {
@@ -1771,7 +1771,7 @@ async function updateAction() {
         }
         btn.disabled = false;
 
-        // Plna APK aktualizacia (len Android)
+        // Full APK update (Android only)
         if (d.appUpdateAvailable) {
             window._apkUrl = d.apkUrl;
             document.getElementById("appUpdStatus").textContent =
@@ -1784,8 +1784,8 @@ async function updateAction() {
     }
 }
 
-// Stiahnutie a instalacia celej novej APK (Android).
-// Android obal zachyti .apk odkaz vo WebView a spusti stiahnutie + instalaciu.
+// Download and install a whole new APK (Android).
+// The Android wrapper intercepts the .apk link in the WebView and starts the download + install.
 function appUpdateAction() {
     if (!window._apkUrl) return;
     document.getElementById("appUpdStatus").textContent = t("updDownloading");
