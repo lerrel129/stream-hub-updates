@@ -1257,7 +1257,7 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
 .card-badge:empty { display: none; }
 
 /* Update panel */
-.update-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #1f2937; border-radius: 14px; padding: 14px 16px; margin-top: 14px; }
+.update-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #1f2937; border-radius: 16px; padding: 12px 16px; margin-bottom: 10px; font-size: 13px; }
 .update-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .update-title { font-weight: bold; font-size: 14px; color: #ffffff; }
 .update-status { font-size: 11px; color: #9ca3af; }
@@ -1302,6 +1302,24 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             <button class="lang-btn" id="lang-cz" onclick="switchLang('cz')">🇨🇿</button>
             <button class="lang-btn" id="lang-en" onclick="switchLang('en')">🇬🇧</button>
         </div>
+    </div>
+
+    <!-- Update panel -->
+    <div class="update-bar">
+        <div class="update-info">
+            <span class="update-title" id="updTitle">Aktualizácia</span>
+            <span class="update-status" id="updStatus">v${APP_VERSION}</span>
+        </div>
+        <button class="update-btn" id="updBtn" onclick="updateAction()">Skontrolovať</button>
+    </div>
+
+    <!-- Full APK update panel (Android only, hidden by default) -->
+    <div class="update-bar hidden" id="appUpdateBar">
+        <div class="update-info">
+            <span class="update-title" id="appUpdTitle">Nová verzia aplikácie</span>
+            <span class="update-status" id="appUpdStatus"></span>
+        </div>
+        <button class="update-btn" id="appUpdBtn" onclick="appUpdateAction()">Stiahnuť APK</button>
     </div>
 
     <!-- Server bar -->
@@ -1421,24 +1439,6 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             </div>
             <span id="wsSpinner" class="spinner hidden"></span>
         </div>
-    </div>
-
-    <!-- Update panel -->
-    <div class="update-bar">
-        <div class="update-info">
-            <span class="update-title" id="updTitle">Aktualizácia</span>
-            <span class="update-status" id="updStatus">v${APP_VERSION}</span>
-        </div>
-        <button class="update-btn" id="updBtn" onclick="updateAction()">Skontrolovať</button>
-    </div>
-
-    <!-- Full APK update panel (Android only, hidden by default) -->
-    <div class="update-bar hidden" id="appUpdateBar">
-        <div class="update-info">
-            <span class="update-title" id="appUpdTitle">Nová verzia aplikácie</span>
-            <span class="update-status" id="appUpdStatus"></span>
-        </div>
-        <button class="update-btn" id="appUpdBtn" onclick="appUpdateAction()">Stiahnuť APK</button>
     </div>
 
 </div>
