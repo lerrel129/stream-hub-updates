@@ -1,5 +1,7 @@
 {
   "version": 1,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "Prvá verzia"
+  "notes": "Prvá verzia",
+  "apkVersion": 1,
+  "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }

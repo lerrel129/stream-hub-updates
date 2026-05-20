@@ -21,6 +21,9 @@ const UPDATE_MANIFEST_URL =
 // Kod, ktorym sa proces ukonci po stiahnuti aktualizacie -
 // obal (desktop/android) podla neho restartuje appku.
 const UPDATE_EXIT_CODE = 87;
+// Verzia nativneho obalu (APK versionCode). Android obal ju posiela
+// ako process.argv[2]. Na PC zostava 0 (APK aktualizacia sa netyka PC).
+const NATIVE_VERSION = parseInt(process.argv[2]) || 0;
 
 // ============ CONFIG ============
 
@@ -1007,6 +1010,7 @@ function startProxyServer() {
                 });
                 const m = typeof r.data === "string" ? JSON.parse(r.data) : r.data;
                 const latest = parseInt(m.version) || 0;
+                const apkVersion = parseInt(m.apkVersion) || 0;
                 res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                 res.end(JSON.stringify({
                     ok: true,
@@ -1014,6 +1018,11 @@ function startProxyServer() {
                     latest,
                     updateAvailable: latest > APP_VERSION,
                     notes: m.notes || "",
+                    // Plna APK aktualizacia (len Android)
+                    apkUrl: m.apkUrl || "",
+                    apkVersion,
+                    nativeVersion: NATIVE_VERSION,
+                    appUpdateAvailable: NATIVE_VERSION > 0 && apkVersion > NATIVE_VERSION && !!m.apkUrl,
                 }));
             } catch (e) {
                 res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -1423,6 +1432,15 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
         <button class="update-btn" id="updBtn" onclick="updateAction()">Skontrolovať</button>
     </div>
 
+    <!-- Full APK update panel (Android only, hidden by default) -->
+    <div class="update-bar hidden" id="appUpdateBar">
+        <div class="update-info">
+            <span class="update-title" id="appUpdTitle">Nová verzia aplikácie</span>
+            <span class="update-status" id="appUpdStatus"></span>
+        </div>
+        <button class="update-btn" id="appUpdBtn" onclick="appUpdateAction()">Stiahnuť APK</button>
+    </div>
+
 </div>
 <script>
 const API = window.location.origin;
@@ -1446,6 +1464,7 @@ const T = {
         updChecking: "Kontrolujem...", updDownloading: "Sťahujem aktualizáciu...",
         updRestarting: "Nainštalované, reštartujem...", updUpToDate: "Máte najnovšiu verziu",
         updAvailable: "Dostupná nová verzia", updError: "Kontrola zlyhala",
+        appUpdTitle: "Nová verzia aplikácie", appUpdBtn: "Stiahnuť APK",
     },
     cz: {
         serverStopped: "Server zastaven", serverRunning: "Server běží", serverUnavailable: "Server nedostupný",
@@ -1461,6 +1480,7 @@ const T = {
         updChecking: "Kontroluji...", updDownloading: "Stahuji aktualizaci...",
         updRestarting: "Nainstalováno, restartuji...", updUpToDate: "Máte nejnovější verzi",
         updAvailable: "Dostupná nová verze", updError: "Kontrola selhala",
+        appUpdTitle: "Nová verze aplikace", appUpdBtn: "Stáhnout APK",
     },
     en: {
         serverStopped: "Server stopped", serverRunning: "Server running", serverUnavailable: "Server unavailable",
@@ -1476,6 +1496,7 @@ const T = {
         updChecking: "Checking...", updDownloading: "Downloading update...",
         updRestarting: "Installed, restarting...", updUpToDate: "You have the latest version",
         updAvailable: "New version available", updError: "Check failed",
+        appUpdTitle: "New app version", appUpdBtn: "Download APK",
     }
 };
 let lang = localStorage.getItem("lang") || "sk";
@@ -1531,6 +1552,8 @@ function applyStrings() {
     document.getElementById("updTitle").textContent = t("updTitle");
     document.getElementById("updBtn").textContent =
         updateState === "available" ? t("updInstall") : t("updCheck");
+    document.getElementById("appUpdTitle").textContent = t("appUpdTitle");
+    document.getElementById("appUpdBtn").textContent = t("appUpdBtn");
 }
 
 function togglePanel(key) {
@@ -1747,10 +1770,26 @@ async function updateAction() {
             st.textContent = t("updUpToDate") + " (v" + d.current + ")";
         }
         btn.disabled = false;
+
+        // Plna APK aktualizacia (len Android)
+        if (d.appUpdateAvailable) {
+            window._apkUrl = d.apkUrl;
+            document.getElementById("appUpdStatus").textContent =
+                "v" + d.nativeVersion + " → v" + d.apkVersion;
+            document.getElementById("appUpdateBar").classList.remove("hidden");
+        }
     } catch (e) {
         st.textContent = (e.message || t("updError"));
         btn.disabled = false;
     }
+}
+
+// Stiahnutie a instalacia celej novej APK (Android).
+// Android obal zachyti .apk odkaz vo WebView a spusti stiahnutie + instalaciu.
+function appUpdateAction() {
+    if (!window._apkUrl) return;
+    document.getElementById("appUpdStatus").textContent = t("updDownloading");
+    window.open(window._apkUrl, "_blank");
 }
 
 // Init
