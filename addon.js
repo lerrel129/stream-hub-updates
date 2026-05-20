@@ -14,7 +14,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 3;
+const APP_VERSION = 4;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1213,7 +1213,8 @@ function startProxyServer() {
 
         res.writeHead(404); res.end("Not found");
     });
-    proxy.listen(PROXY_PORT, () => console.log(`[PROXY] Running on port ${PROXY_PORT}`));
+    // Bind to 127.0.0.1 only - the server must not be reachable from the network
+    proxy.listen(PROXY_PORT, "127.0.0.1", () => console.log(`[PROXY] Running on port ${PROXY_PORT}`));
 }
 
 function getConfigHTML() {
@@ -2227,7 +2228,8 @@ function startAddonServer() {
         res.writeHead(404); res.end("Not found");
     });
 
-    server.listen(ADDON_PORT, () => {
+    // Bind to 127.0.0.1 only - the server must not be reachable from the network
+    server.listen(ADDON_PORT, "127.0.0.1", () => {
         console.log(`HTTP addon accessible at: http://127.0.0.1:${ADDON_PORT}/`);
     });
 }
