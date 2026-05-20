@@ -14,7 +14,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 1;
+const APP_VERSION = 2;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1447,6 +1447,8 @@ const API = window.location.origin;
 let addonUrls = {};
 let openPanel = null;
 let updateState = "idle"; // idle | available
+const APP_VER = ${APP_VERSION};
+let lastCheck = null; // last /api/update/check result (for re-render on language switch)
 
 // ---- Translations ----
 const T = {
@@ -1464,6 +1466,7 @@ const T = {
         updChecking: "Kontrolujem...", updDownloading: "Sťahujem aktualizáciu...",
         updRestarting: "Nainštalované, reštartujem...", updUpToDate: "Máte najnovšiu verziu",
         updAvailable: "Dostupná nová verzia", updError: "Kontrola zlyhala",
+        updAppAvailable: "Dostupná nová verzia aplikácie",
         appUpdTitle: "Nová verzia aplikácie", appUpdBtn: "Stiahnuť APK",
     },
     cz: {
@@ -1480,6 +1483,7 @@ const T = {
         updChecking: "Kontroluji...", updDownloading: "Stahuji aktualizaci...",
         updRestarting: "Nainstalováno, restartuji...", updUpToDate: "Máte nejnovější verzi",
         updAvailable: "Dostupná nová verze", updError: "Kontrola selhala",
+        updAppAvailable: "Dostupná nová verze aplikace",
         appUpdTitle: "Nová verze aplikace", appUpdBtn: "Stáhnout APK",
     },
     en: {
@@ -1496,6 +1500,7 @@ const T = {
         updChecking: "Checking...", updDownloading: "Downloading update...",
         updRestarting: "Installed, restarting...", updUpToDate: "You have the latest version",
         updAvailable: "New version available", updError: "Check failed",
+        updAppAvailable: "New app version available",
         appUpdTitle: "New app version", appUpdBtn: "Download APK",
     }
 };
@@ -1550,10 +1555,9 @@ function applyStrings() {
 
     // Update panel
     document.getElementById("updTitle").textContent = t("updTitle");
-    document.getElementById("updBtn").textContent =
-        updateState === "available" ? t("updInstall") : t("updCheck");
     document.getElementById("appUpdTitle").textContent = t("appUpdTitle");
     document.getElementById("appUpdBtn").textContent = t("appUpdBtn");
+    renderUpdateUI(); // re-render status + button in the current language
 }
 
 function togglePanel(key) {
@@ -1757,30 +1761,52 @@ async function updateAction() {
     try {
         const r = await fetch(API + "/api/update/check");
         const d = await r.json();
+        btn.disabled = false;
         if (!d.ok) {
+            lastCheck = null;
             st.textContent = t("updError");
-            btn.disabled = false;
             return;
         }
-        if (d.updateAvailable) {
-            updateState = "available";
-            st.textContent = t("updAvailable") + " (v" + d.latest + ")";
-            btn.textContent = t("updInstall");
-        } else {
-            st.textContent = t("updUpToDate") + " (v" + d.current + ")";
-        }
-        btn.disabled = false;
-
-        // Full APK update (Android only)
-        if (d.appUpdateAvailable) {
-            window._apkUrl = d.apkUrl;
-            document.getElementById("appUpdStatus").textContent =
-                "v" + d.nativeVersion + " → v" + d.apkVersion;
-            document.getElementById("appUpdateBar").classList.remove("hidden");
-        }
+        lastCheck = d;
+        updateState = d.updateAvailable ? "available" : "idle";
+        renderUpdateUI();
     } catch (e) {
+        lastCheck = null;
         st.textContent = (e.message || t("updError"));
         btn.disabled = false;
+    }
+}
+
+// Renders the update section (status text + buttons) from the last
+// check result, in the currently selected language. Called after a
+// check and on every language switch (from applyStrings).
+function renderUpdateUI() {
+    const st = document.getElementById("updStatus");
+    const btn = document.getElementById("updBtn");
+    const d = lastCheck;
+
+    if (!d) {
+        st.textContent = "v" + APP_VER;
+        btn.textContent = t("updCheck");
+        return;
+    }
+    if (d.updateAvailable) {
+        st.textContent = t("updAvailable") + " (v" + d.latest + ")";
+        btn.textContent = t("updInstall");
+    } else if (d.appUpdateAvailable) {
+        st.textContent = t("updAppAvailable");
+        btn.textContent = t("updCheck");
+    } else {
+        st.textContent = t("updUpToDate") + " (v" + d.current + ")";
+        btn.textContent = t("updCheck");
+    }
+
+    // Full APK update panel (Android only)
+    if (d.appUpdateAvailable) {
+        window._apkUrl = d.apkUrl;
+        document.getElementById("appUpdStatus").textContent =
+            "v" + d.nativeVersion + " → v" + d.apkVersion;
+        document.getElementById("appUpdateBar").classList.remove("hidden");
     }
 }
 

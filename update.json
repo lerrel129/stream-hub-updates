@@ -1,7 +1,7 @@
 {
-  "version": 1,
+  "version": 2,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "Initial release",
+  "notes": "Fixed update section: status text now follows the selected language and reflects an available APK update",
   "apkVersion": 2,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
