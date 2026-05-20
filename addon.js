@@ -14,7 +14,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 2;
+const APP_VERSION = 3;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1304,22 +1304,13 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
         </div>
     </div>
 
-    <!-- Update panel -->
+    <!-- Update panel (Android checks the APK, PC checks addon.js) -->
     <div class="update-bar">
         <div class="update-info">
             <span class="update-title" id="updTitle">Aktualizácia</span>
             <span class="update-status" id="updStatus">v${APP_VERSION}</span>
         </div>
         <button class="update-btn" id="updBtn" onclick="updateAction()">Skontrolovať</button>
-    </div>
-
-    <!-- Full APK update panel (Android only, hidden by default) -->
-    <div class="update-bar hidden" id="appUpdateBar">
-        <div class="update-info">
-            <span class="update-title" id="appUpdTitle">Nová verzia aplikácie</span>
-            <span class="update-status" id="appUpdStatus"></span>
-        </div>
-        <button class="update-btn" id="appUpdBtn" onclick="appUpdateAction()">Stiahnuť APK</button>
     </div>
 
     <!-- Server bar -->
@@ -1448,7 +1439,10 @@ let addonUrls = {};
 let openPanel = null;
 let updateState = "idle"; // idle | available
 const APP_VER = ${APP_VERSION};
+const NATIVE_VER = ${NATIVE_VERSION};
+const isAndroid = NATIVE_VER > 0; // Android wrapper passes its versionCode
 let lastCheck = null; // last /api/update/check result (for re-render on language switch)
+let pendingApkUrl = null;
 
 // ---- Translations ----
 const T = {
@@ -1555,8 +1549,6 @@ function applyStrings() {
 
     // Update panel
     document.getElementById("updTitle").textContent = t("updTitle");
-    document.getElementById("appUpdTitle").textContent = t("appUpdTitle");
-    document.getElementById("appUpdBtn").textContent = t("appUpdBtn");
     renderUpdateUI(); // re-render status + button in the current language
 }
 
@@ -1729,28 +1721,38 @@ function installOne(key) {
     });
 }
 
-// ---- OTA update ----
+// ---- Update ----
+// On Android the update panel checks the full APK; on PC it checks addon.js.
 async function updateAction() {
     const btn = document.getElementById("updBtn");
     const st = document.getElementById("updStatus");
 
     if (updateState === "available") {
-        // Download and install
-        btn.disabled = true;
-        st.textContent = t("updDownloading");
-        try {
-            const r = await fetch(API + "/api/update/apply", { method: "POST" });
-            const d = await r.json();
-            if (d.ok) {
-                st.textContent = t("updRestarting");
-                // the app restarts itself with the new code
-            } else {
-                st.textContent = (d.error || t("updError"));
+        if (isAndroid) {
+            // Download the new APK - the Android wrapper intercepts the .apk
+            // link in the WebView and starts the download + installation.
+            if (pendingApkUrl) {
+                st.textContent = t("updDownloading");
+                window.open(pendingApkUrl, "_blank");
+            }
+        } else {
+            // PC: download and apply the new addon.js
+            btn.disabled = true;
+            st.textContent = t("updDownloading");
+            try {
+                const r = await fetch(API + "/api/update/apply", { method: "POST" });
+                const d = await r.json();
+                if (d.ok) {
+                    st.textContent = t("updRestarting");
+                    // the app restarts itself with the new code
+                } else {
+                    st.textContent = (d.error || t("updError"));
+                    btn.disabled = false;
+                }
+            } catch (e) {
+                st.textContent = (e.message || t("updError"));
                 btn.disabled = false;
             }
-        } catch (e) {
-            st.textContent = (e.message || t("updError"));
-            btn.disabled = false;
         }
         return;
     }
@@ -1768,7 +1770,12 @@ async function updateAction() {
             return;
         }
         lastCheck = d;
-        updateState = d.updateAvailable ? "available" : "idle";
+        if (isAndroid) {
+            updateState = d.appUpdateAvailable ? "available" : "idle";
+            pendingApkUrl = d.appUpdateAvailable ? d.apkUrl : null;
+        } else {
+            updateState = d.updateAvailable ? "available" : "idle";
+        }
         renderUpdateUI();
     } catch (e) {
         lastCheck = null;
@@ -1777,7 +1784,7 @@ async function updateAction() {
     }
 }
 
-// Renders the update section (status text + buttons) from the last
+// Renders the update section (status text + button) from the last
 // check result, in the currently selected language. Called after a
 // check and on every language switch (from applyStrings).
 function renderUpdateUI() {
@@ -1786,36 +1793,30 @@ function renderUpdateUI() {
     const d = lastCheck;
 
     if (!d) {
-        st.textContent = "v" + APP_VER;
+        st.textContent = "v" + (isAndroid ? NATIVE_VER : APP_VER);
         btn.textContent = t("updCheck");
         return;
     }
-    if (d.updateAvailable) {
-        st.textContent = t("updAvailable") + " (v" + d.latest + ")";
-        btn.textContent = t("updInstall");
-    } else if (d.appUpdateAvailable) {
-        st.textContent = t("updAppAvailable");
-        btn.textContent = t("updCheck");
+
+    if (isAndroid) {
+        // Android - only the full APK update
+        if (d.appUpdateAvailable) {
+            st.textContent = t("updAppAvailable");
+            btn.textContent = t("appUpdBtn");
+        } else {
+            st.textContent = t("updUpToDate") + " (v" + (d.nativeVersion || NATIVE_VER) + ")";
+            btn.textContent = t("updCheck");
+        }
     } else {
-        st.textContent = t("updUpToDate") + " (v" + d.current + ")";
-        btn.textContent = t("updCheck");
+        // PC - only the addon.js update
+        if (d.updateAvailable) {
+            st.textContent = t("updAvailable") + " (v" + d.latest + ")";
+            btn.textContent = t("updInstall");
+        } else {
+            st.textContent = t("updUpToDate") + " (v" + d.current + ")";
+            btn.textContent = t("updCheck");
+        }
     }
-
-    // Full APK update panel (Android only)
-    if (d.appUpdateAvailable) {
-        window._apkUrl = d.apkUrl;
-        document.getElementById("appUpdStatus").textContent =
-            "v" + d.nativeVersion + " → v" + d.apkVersion;
-        document.getElementById("appUpdateBar").classList.remove("hidden");
-    }
-}
-
-// Download and install a whole new APK (Android).
-// The Android wrapper intercepts the .apk link in the WebView and starts the download + install.
-function appUpdateAction() {
-    if (!window._apkUrl) return;
-    document.getElementById("appUpdStatus").textContent = t("updDownloading");
-    window.open(window._apkUrl, "_blank");
 }
 
 // Init
