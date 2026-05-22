@@ -1,7 +1,7 @@
 {
   "version": 8,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "Menu logo redrawn as a crisp vector (no jagged edges)",
-  "apkVersion": 16,
+  "notes": "Loading screen: dark background and the vector logo",
+  "apkVersion": 17,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
