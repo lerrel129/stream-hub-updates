@@ -14,7 +14,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 5;
+const APP_VERSION = 6;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1281,8 +1281,8 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
 .btn-login { flex: 1; padding: 10px; border: none; border-radius: 12px; font-size: 13px; cursor: pointer; font-weight: bold; color: #fff; background: #4a9c4f; transition: background 0.15s; }
 .btn-login:hover { background: #3d8b40; }
 .btn-login:disabled { opacity: 0.5; cursor: not-allowed; }
-.btn-logout-sm { padding: 10px 16px; background: #374151; border: none; border-radius: 12px; color: #9ca3af; font-size: 13px; cursor: pointer; transition: all 0.15s; }
-.btn-logout-sm:hover { background: #4b5563; color: #fff; }
+.btn-logout-sm { padding: 10px 16px; background: #dc2626; border: none; border-radius: 12px; color: #fff; font-size: 13px; cursor: pointer; transition: all 0.15s; }
+.btn-logout-sm:hover { background: #b91c1c; color: #fff; }
 .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #374151; border-top-color: #4a9c4f; border-radius: 50%; animation: spin 0.6s linear infinite; margin-left: 6px; vertical-align: middle; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .hidden { display: none; }
@@ -1320,7 +1320,7 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
     <!-- Server bar -->
     <div class="server-bar">
         <span id="serverDot" class="dot dot-red"></span>
-        <span id="serverLabel" class="label" style="color:#9ca3af">Server zastavený</span>
+        <span id="serverLabel" class="label" style="color:#f87171">Server zastavený</span>
         <button class="server-toggle" id="serverToggle" onclick="toggleServer()">Spustiť</button>
     </div>
 
@@ -1575,7 +1575,7 @@ async function loadStatus() {
         const running = s.serverRunning;
         document.getElementById("serverDot").className = "dot " + (running ? "dot-green" : "dot-red");
         document.getElementById("serverLabel").textContent = running ? t("serverRunning") : t("serverStopped");
-        document.getElementById("serverLabel").style.color = running ? "#34d399" : "#9ca3af";
+        document.getElementById("serverLabel").style.color = running ? "#34d399" : "#f87171";
         document.getElementById("serverToggle").textContent = running ? t("stop") : t("start");
 
         // ST

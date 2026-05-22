@@ -1,7 +1,7 @@
 {
-  "version": 5,
+  "version": 6,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "Update panel now shows the version name (e.g. 1.3) instead of the internal number",
-  "apkVersion": 13,
+  "notes": "Logout button is now red; the 'Server stopped' text is shown in red",
+  "apkVersion": 14,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
