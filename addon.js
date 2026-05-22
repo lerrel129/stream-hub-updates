@@ -14,7 +14,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 4;
+const APP_VERSION = 5;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -24,6 +24,9 @@ const UPDATE_EXIT_CODE = 87;
 // Version of the native wrapper (APK versionCode). The Android wrapper
 // passes it as process.argv[2]. On PC it stays 0 (APK update is PC-irrelevant).
 const NATIVE_VERSION = parseInt(process.argv[2]) || 0;
+// Version NAME shown to the user (e.g. "1.3"). The wrapper passes it as
+// process.argv[3] - Android: versionName, PC: the desktop app version.
+const NATIVE_VERSION_NAME = process.argv[3] || "";
 
 // ============ CONFIG ============
 
@@ -1441,6 +1444,7 @@ let openPanel = null;
 let updateState = "idle"; // idle | available
 const APP_VER = ${APP_VERSION};
 const NATIVE_VER = ${NATIVE_VERSION};
+const NATIVE_VER_NAME = "${NATIVE_VERSION_NAME}";
 const isAndroid = NATIVE_VER > 0; // Android wrapper passes its versionCode
 let lastCheck = null; // last /api/update/check result (for re-render on language switch)
 let pendingApkUrl = null;
@@ -1793,8 +1797,12 @@ function renderUpdateUI() {
     const btn = document.getElementById("updBtn");
     const d = lastCheck;
 
+    // Version shown to the user - the version NAME (e.g. "1.3"), not the
+    // internal counter. Falls back to the addon.js version if unknown.
+    const shownVer = NATIVE_VER_NAME ? ("v" + NATIVE_VER_NAME) : ("v" + APP_VER);
+
     if (!d) {
-        st.textContent = "v" + (isAndroid ? NATIVE_VER : APP_VER);
+        st.textContent = shownVer;
         btn.textContent = t("updCheck");
         return;
     }
@@ -1805,16 +1813,16 @@ function renderUpdateUI() {
             st.textContent = t("updAppAvailable");
             btn.textContent = t("appUpdBtn");
         } else {
-            st.textContent = t("updUpToDate") + " (v" + (d.nativeVersion || NATIVE_VER) + ")";
+            st.textContent = t("updUpToDate") + " (" + shownVer + ")";
             btn.textContent = t("updCheck");
         }
     } else {
         // PC - only the addon.js update
         if (d.updateAvailable) {
-            st.textContent = t("updAvailable") + " (v" + d.latest + ")";
+            st.textContent = t("updAvailable");
             btn.textContent = t("updInstall");
         } else {
-            st.textContent = t("updUpToDate") + " (v" + d.current + ")";
+            st.textContent = t("updUpToDate") + " (" + shownVer + ")";
             btn.textContent = t("updCheck");
         }
     }
