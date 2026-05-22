@@ -1,7 +1,7 @@
 {
   "version": 4,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "Security fix: the local server is no longer reachable from the network (binds to 127.0.0.1 only)",
-  "apkVersion": 11,
+  "notes": "Android: auto-start after device boot and automatic recovery if the server stops",
+  "apkVersion": 12,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
