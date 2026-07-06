@@ -14,7 +14,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 8;
+const APP_VERSION = 9;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -30,26 +30,87 @@ const NATIVE_VERSION_NAME = process.argv[3] || "";
 
 // ============ CONFIG ============
 
+// Passwords in config.json are stored obfuscated (prefix "enc1:", XOR + base64).
+// This is not real encryption - it only prevents casual plaintext reading.
+const SECRET_KEY = "StreamHub-cfg-v1";
+const ENC_PREFIX = "enc1:";
+const PASSWORD_KEYS = ["stPassword", "fsPassword", "wsPassword", "ptPassword"];
+
+function xorBytes(buf) {
+    const out = Buffer.alloc(buf.length);
+    for (let i = 0; i < buf.length; i++) out[i] = buf[i] ^ SECRET_KEY.charCodeAt(i % SECRET_KEY.length);
+    return out;
+}
+
+function encSecret(plain) {
+    if (!plain) return plain;
+    return ENC_PREFIX + xorBytes(Buffer.from(plain, "utf8")).toString("base64");
+}
+
+function decSecret(stored) {
+    if (!stored || !stored.startsWith(ENC_PREFIX)) return stored; // plaintext from older versions
+    try { return xorBytes(Buffer.from(stored.slice(ENC_PREFIX.length), "base64")).toString("utf8"); }
+    catch (e) { return ""; }
+}
+
 function loadConfig() {
     try {
-        if (fs.existsSync(CONFIG_PATH)) return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+        if (fs.existsSync(CONFIG_PATH)) {
+            const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+            for (const k of PASSWORD_KEYS) if (cfg[k]) cfg[k] = decSecret(cfg[k]);
+            return cfg;
+        }
     } catch (e) { console.error("[CONFIG] Load error:", e.message); }
     return {};
 }
 
 function saveConfig(cfg) {
-    try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf8"); }
-    catch (e) { console.error("[CONFIG] Save error:", e.message); }
+    try {
+        const out = { ...cfg };
+        for (const k of PASSWORD_KEYS) if (out[k]) out[k] = encSecret(out[k]);
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2), "utf8");
+    } catch (e) { console.error("[CONFIG] Save error:", e.message); }
 }
 
 let config = loadConfig();
 
+// ============ CAPPED CACHES ============
+
+// LRU cache behind a Proxy so existing `cache[key]` syntax keeps working.
+// Prevents unbounded memory growth (important on Android where the
+// foreground service runs for days).
+function lruCache(maxEntries) {
+    const map = new Map();
+    return new Proxy({}, {
+        get(_, key) {
+            if (typeof key !== "string") return undefined;
+            if (!map.has(key)) return undefined;
+            const val = map.get(key);
+            map.delete(key); map.set(key, val); // refresh recency
+            return val;
+        },
+        set(_, key, val) {
+            if (map.has(key)) map.delete(key);
+            map.set(key, val);
+            if (map.size > maxEntries) map.delete(map.keys().next().value);
+            return true;
+        },
+        has(_, key) { return map.has(key); },
+        deleteProperty(_, key) { map.delete(key); return true; },
+        ownKeys() { return [...map.keys()]; },
+        getOwnPropertyDescriptor(_, key) {
+            if (!map.has(key)) return undefined;
+            return { value: map.get(key), enumerable: true, configurable: true, writable: true };
+        },
+    });
+}
+
 // ============ SLEDUJTETO ============
 
-const urlCache = {};
-const metaCache = {};
-const fileDataCache = {};
-const streamCache = {};
+const urlCache = lruCache(2000);
+const metaCache = lruCache(2000);
+const fileDataCache = lruCache(2000);
+const streamCache = lruCache(500);
 let sessionCookie = "";
 let loggedIn = false;
 let stPremium = false;
@@ -206,14 +267,21 @@ async function fetchVideos(query, page = 1) {
     } catch (e) { console.error("[CATALOG] Error:", e.message); return []; }
 }
 
-async function getStreamInfo(videoId) {
+async function getStreamInfo(videoId, retried = false) {
     if (streamCache[videoId] && Date.now() - streamCache[videoId].ts < 300000) return streamCache[videoId];
     try {
         const filePageUrl = urlCache[videoId] || `${BASE_URL}/file/${videoId}/`;
         const pageResp = await api(filePageUrl, { headers: { Accept: "text/html", Referer: BASE_URL } });
         const html = typeof pageResp.data === "string" ? pageResp.data : "";
         const initMatch = html.match(/init\(\s*(\d+)\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*\)/);
-        if (!initMatch) return null;
+        if (!initMatch) {
+            // Session may have expired - re-login once from saved credentials and retry
+            if (!retried && config.stEmail && config.stPassword) {
+                console.log("[STREAM] ST init not found, re-login + retry...");
+                if (await login(config.stEmail, config.stPassword)) return getStreamInfo(videoId, true);
+            }
+            return null;
+        }
         const [, fileId, playerBase, , mirror] = initMatch;
         const linkResp = await api(`${mirror}/services/add-file-link`, {
             method: "POST", data: { params: { id: parseInt(fileId) } },
@@ -284,13 +352,31 @@ function stFormatDesc(videoName, fd) {
     return parts.join("\n");
 }
 
+// ============ AUDIO DETECTION (shared) ============
+
+// Word-boundary based SK/CZ detection - a plain substring test flagged
+// e.g. "maska"/"whiskey" as SK and any "cs" inside a word as CZ.
+const SK_AUDIO_RE = /(^|[^a-z0-9])(sk|svk|slovak|slovensk\w*)($|[^a-z0-9])/;
+const CZ_AUDIO_RE = /(^|[^a-z0-9])(cz|cze|cs|czech|cesk\w*)($|[^a-z0-9])/;
+const DABING_RE = /(^|[^a-z0-9])dabing($|[^a-z0-9])/;
+
+function detectAudio(name) {
+    const n = stripDiacritics((name || "").toLowerCase());
+    const tags = [];
+    if (SK_AUDIO_RE.test(n)) tags.push("SK");
+    if (CZ_AUDIO_RE.test(n)) tags.push("CZ");
+    // bare "dabing" without an explicit language marker usually means CZ
+    else if (!tags.length && DABING_RE.test(n)) tags.push("CZ");
+    return tags.join(" ");
+}
+
 // ============ FASTSHARE ============
 
 let fsCookie = "";
 let fsLoggedIn = false;
 let fsUnlimited = false;
 let fsUser = "";
-const fsFileCache = {};
+const fsFileCache = lruCache(1000);
 
 async function fsLogin(username, password) {
     try {
@@ -331,7 +417,8 @@ async function fsSearch(query) {
         const term = makeFsTerm(query);
         let limit = 1;
         const allItems = [];
-        while (true) {
+        const MAX_FS_PAGES = 10; // safety cap - the loop used to be unbounded
+        for (let pageNo = 0; pageNo < MAX_FS_PAGES; pageNo++) {
             const pageUrl = `https://fastshare.cloud/test2.php?token=${token}&search_purpose=0&search_resolution=0&order=&type=video&term=${term}&plain_search=0&limit=${limit}&step=3`;
             const resp = await axios.get(pageUrl, {
                 headers: { "User-Agent": "Mozilla/5.0", ...(fsCookie ? { Cookie: fsCookie } : {}) },
@@ -356,11 +443,7 @@ async function fsSearch(query) {
             const duration = durM ? durM[1] : "";
             const resolution = detailMatches[1]?.trim().split(";").pop()?.trim() || "";
             const size = (detailMatches[3] || detailMatches[2] || "").trim();
-            const fnLower = fileName.toLowerCase();
-            let audio = "";
-            if ((fnLower.includes("sk") || fnLower.includes("sl")) && !fnLower.includes("česk") && !fnLower.includes("cesk")) audio += "SK ";
-            if (fnLower.includes("cz") || fnLower.includes("cs") || fnLower.includes("český") || fnLower.includes("cesky")) audio += "CZ ";
-            audio = audio.trim();
+            const audio = detectAudio(fileName);
             const idM = dlHref.match(/[?&]id=(\d+)/);
             const fsId = idM ? idM[1] : String(dlHref.hashCode || Math.random());
             const file = { name: fileName, size, duration, resolution, downloadUrl: dlHref, audioTracks: audio, fsId };
@@ -395,7 +478,7 @@ function fsFormatDesc(file) {
 
 // ============ HELLSPY ============
 
-const hsFileCache = {};
+const hsFileCache = lruCache(1000);
 
 async function hsSearch(query) {
     if (!query) return [];
@@ -410,15 +493,11 @@ async function hsSearch(query) {
             const suffix = objType.length >= 5 ? objType.substring(objType.length - 5) : objType;
             const sizeGB = v.size > 0 ? `${(v.size / (1024 ** 3)).toFixed(2)} GB` : "";
             const dur = v.duration > 0 ? `${Math.floor(v.duration / 3600)}h ${Math.floor((v.duration % 3600) / 60)}m` : "";
-            const fnLower = (v.title || "").toLowerCase();
-            let audio = "";
-            if ((fnLower.includes("sk") || fnLower.includes("sl")) && !fnLower.includes("česk") && !fnLower.includes("cesk")) audio += "SK ";
-            if (fnLower.includes("cz") || fnLower.includes("cs") || fnLower.includes("český") || fnLower.includes("cesky")) audio += "CZ ";
             const file = {
                 name: v.title, size: sizeGB, duration: dur,
                 thumbnail: v.thumbs?.[0] || "",
                 downloadUrl: `https://api.hellspy.to/${prefix}/${suffix}/${v.id}/${v.fileHash}/download`,
-                audioTracks: audio.trim(), hsId: String(v.id),
+                audioTracks: detectAudio(v.title), hsId: String(v.id),
             };
             hsFileCache[file.hsId] = file;
             files.push(file);
@@ -445,7 +524,7 @@ function hsFormatDesc(file) {
 
 // ============ TMDB (shared) ============
 
-const tmdbCache = {};
+const tmdbCache = lruCache(500);
 async function tmdbGetNames(imdbId) {
     if (tmdbCache[imdbId]) return tmdbCache[imdbId];
     const names = []; let year = ""; let czTitle = ""; let skTitle = "";
@@ -478,7 +557,12 @@ async function tmdbGetNames(imdbId) {
                 if (skTitle && !names.includes(skTitle)) names.push(skTitle);
             }
         }
-    } catch (e) { console.error("[TMDB] Error:", e.message); }
+    } catch (e) {
+        // Network/API failure - do NOT cache, otherwise the title would
+        // return no streams until restart. Next request retries TMDB.
+        console.error("[TMDB] Error:", e.message);
+        return { names, year, czTitle, skTitle };
+    }
     const result = { names, year, czTitle, skTitle };
     tmdbCache[imdbId] = result;
     return result;
@@ -531,11 +615,17 @@ function enhanceAudioByTitle(files, nameField, imdbId) {
 
 function makeEpFilter(epTag, season, episode) {
     if (!epTag) return null;
-    const altTag = `${season}x${String(episode).padStart(2,"0")}`;
-    const altTag2 = `${String(season).padStart(2,"0")}x${String(episode).padStart(2,"0")}`;
+    const ss = String(season).padStart(2, "0"), ee = String(episode).padStart(2, "0");
+    const variants = [
+        epTag.toLowerCase(),      // s01e02
+        `${season}x${ee}`,        // 1x02
+        `${ss}x${ee}`,            // 01x02
+        `s${ss} e${ee}`,          // s01 e02
+        `s${season}e${episode}`,  // s1e2
+    ];
     return (name) => {
         const lower = name.toLowerCase();
-        return lower.includes(epTag.toLowerCase()) || lower.includes(altTag) || lower.includes(altTag2);
+        return variants.some(v => lower.includes(v));
     };
 }
 
@@ -543,8 +633,8 @@ async function searchStForImdb(imdbId, season, episode) {
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
     const seen = new Set(), all = [];
-    for (const q of queries) {
-        const r = await fetchVideos(q);
+    const perQuery = await Promise.all(queries.map(q => fetchVideos(q)));
+    for (const r of perQuery) {
         for (const item of r) { if (!seen.has(item.id)) { seen.add(item.id); all.push(item); } }
     }
     const matchesEp = makeEpFilter(epTag, season, episode);
@@ -556,8 +646,8 @@ async function searchFsForImdb(imdbId, season, episode) {
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
     const seen = new Set(), all = [];
-    for (const q of queries) {
-        const r = await fsSearch(q);
+    const perQuery = await Promise.all(queries.map(q => fsSearch(q)));
+    for (const r of perQuery) {
         for (const f of r) { if (!seen.has(f.fsId)) { seen.add(f.fsId); all.push(f); } }
     }
     const matchesEp = makeEpFilter(epTag, season, episode);
@@ -568,8 +658,8 @@ async function searchHsForImdb(imdbId, season, episode) {
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
     const seen = new Set(), all = [];
-    for (const q of queries) {
-        const r = await hsSearch(q);
+    const perQuery = await Promise.all(queries.map(q => hsSearch(q)));
+    for (const r of perQuery) {
         for (const f of r) { if (!seen.has(f.hsId)) { seen.add(f.hsId); all.push(f); } }
     }
     const matchesEp = makeEpFilter(epTag, season, episode);
@@ -581,8 +671,8 @@ async function searchWsForImdb(imdbId, season, episode) {
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
     const seen = new Set(), all = [];
-    for (const q of queries) {
-        const r = await wsSearch(q);
+    const perQuery = await Promise.all(queries.map(q => wsSearch(q)));
+    for (const r of perQuery) {
         for (const f of r) { if (!seen.has(f.wsId)) { seen.add(f.wsId); all.push(f); } }
     }
     const matchesEp = makeEpFilter(epTag, season, episode);
@@ -598,7 +688,7 @@ let wsToken = "";
 let wsLoggedIn = false;
 let wsVip = false;
 let wsUser = "";
-const wsFileCache = {};
+const wsFileCache = lruCache(1000);
 
 async function wsLogin(username, password) {
     try {
@@ -648,13 +738,19 @@ async function wsCheckVip() {
     } catch (e) { console.error("[WS] VIP check error:", e.message); }
 }
 
-async function wsSearch(query) {
+async function wsSearch(query, retried = false) {
     if (!query || !wsLoggedIn) return [];
     try {
         const resp = await axios.post("https://webshare.cz/api/search/",
             `what=${encodeURIComponent(query)}&category=video&sort=&limit=25&offset=0&wst=${wsToken}`, {
             headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }, timeout: 15000,
         });
+        // Expired token - re-login once from saved credentials and retry
+        if (/<status>FATAL<\/status>/.test(resp.data) && !retried && config.wsUsername && config.wsPassword) {
+            console.log("[WEBSHARE] Token expired, re-login + retry...");
+            if (await wsLogin(config.wsUsername, config.wsPassword)) return wsSearch(query, true);
+            return [];
+        }
         const files = [];
         const fileRegex = /<file>([\s\S]*?)<\/file>/g;
         let m;
@@ -668,12 +764,7 @@ async function wsSearch(query) {
             const positiveVotes = parseInt(get("positive_votes")) || 0;
             const negativeVotes = parseInt(get("negative_votes")) || 0;
 
-            const fnLower = name.toLowerCase();
-            const audio = [];
-            if ((/sk/i.test(fnLower) || /sl/i.test(fnLower)) && !/česk/i.test(fnLower) && !/cesk/i.test(fnLower)) audio.push("SK");
-            if (/cz/i.test(fnLower) || /cs/i.test(fnLower) || /český/i.test(fnLower) || /cesky/i.test(fnLower)) audio.push("CZ");
-
-            const file = { wsId: ident, name, size: sizeStr, audioTracks: audio.join(" "), positiveVotes, negativeVotes };
+            const file = { wsId: ident, name, size: sizeStr, audioTracks: detectAudio(name), positiveVotes, negativeVotes };
             wsFileCache[ident] = file;
             files.push(file);
         }
@@ -682,14 +773,20 @@ async function wsSearch(query) {
     } catch (e) { console.error("[WEBSHARE] Search error:", e.message); return []; }
 }
 
-async function wsGetLink(ident) {
+async function wsGetLink(ident, retried = false) {
     try {
         const resp = await axios.post("https://webshare.cz/api/file_link/",
             `ident=${encodeURIComponent(ident)}&download_type=video_stream&force_https=1&wst=${wsToken}`, {
             headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }, timeout: 10000,
         });
         const linkMatch = resp.data.match(/<link>([^<]*)<\/link>/);
-        return linkMatch?.[1] || null;
+        if (linkMatch?.[1]) return linkMatch[1];
+        // Expired token - re-login once from saved credentials and retry
+        if (!retried && config.wsUsername && config.wsPassword) {
+            console.log("[WEBSHARE] file_link failed, re-login + retry...");
+            if (await wsLogin(config.wsUsername, config.wsPassword)) return wsGetLink(ident, true);
+        }
+        return null;
     } catch (e) { console.error("[WEBSHARE] Link error:", e.message); return null; }
 }
 
@@ -713,7 +810,7 @@ function wsFormatDesc(f) {
 let ptCookie = "";
 let ptLoggedIn = false;
 let ptUser = "";
-const ptFileCache = {};
+const ptFileCache = lruCache(1000);
 
 async function ptLogin(email, password) {
     try {
@@ -815,13 +912,7 @@ async function ptSearch(query) {
             const thumbM = block.match(/<img[^>]*src="(https:\/\/thumb[^"]+)"[^>]*/i);
             const thumbnail = thumbM ? thumbM[1] : "";
 
-            const fnLower = name.toLowerCase();
-            let audio = "";
-            if ((fnLower.includes("sk") || fnLower.includes("sl")) && !fnLower.includes("česk") && !fnLower.includes("cesk")) audio += "SK ";
-            if (fnLower.includes("cz") || fnLower.includes("cs") || fnLower.includes("český") || fnLower.includes("cesky") || fnLower.includes("dabing")) audio += "CZ ";
-            audio = audio.trim();
-
-            const file = { name, ptId, ptSlug, duration, size, quality, likes, thumbnail, audioTracks: audio };
+            const file = { name, ptId, ptSlug, duration, size, quality, likes, thumbnail, audioTracks: detectAudio(name) };
             ptFileCache[ptId] = file;
             files.push(file);
         }
@@ -874,8 +965,8 @@ async function searchPtForImdb(imdbId, season, episode) {
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
     const seen = new Set(), all = [];
-    for (const q of queries) {
-        const r = await ptSearch(q);
+    const perQuery = await Promise.all(queries.map(q => ptSearch(q)));
+    for (const r of perQuery) {
         for (const f of r) { if (!seen.has(f.ptId)) { seen.add(f.ptId); all.push(f); } }
     }
     const matchesEp = makeEpFilter(epTag, season, episode);
@@ -909,6 +1000,24 @@ function wsLabel() { return `Webshare.cz ${wsVip ? "✓" : "✗"}`; }
 
 function startProxyServer() {
     const proxy = http.createServer(async (req, res) => {
+        // "Zastaviť server" in the UI now stops streaming too, not just the addon handlers
+        const isStreamReq = /^\/(proxy|fsproxy|ptproxy|wsproxy)\//.test(req.url);
+        if (isStreamReq && !serverRunning) { res.writeHead(503); res.end("Server stopped"); return; }
+
+        // Webshare lazy resolve: /wsproxy/{ident} -> 302 redirect to the direct link.
+        // The link is resolved only at playback time instead of resolving every
+        // search result up front (which risked Stremio timeouts).
+        const wsMatch = req.url.match(/^\/wsproxy\/([^/?]+)/);
+        if (wsMatch) {
+            try {
+                const link = await wsGetLink(decodeURIComponent(wsMatch[1]));
+                if (!link) { res.writeHead(502); res.end("No link"); return; }
+                res.writeHead(302, { Location: link });
+                res.end();
+            } catch (e) { if (!res.headersSent) { res.writeHead(502); res.end("Error"); } }
+            return;
+        }
+
         // SledujTeTo proxy: /proxy/{videoId}
         const stMatch = req.url.match(/^\/proxy\/(\d+)/);
         if (stMatch) {
@@ -1609,6 +1718,16 @@ function togglePanel(key) {
     else { panel.classList.add("open"); card.classList.add("active"); openPanel = key; }
 }
 
+function closePanel(key) {
+    const panel = document.getElementById("panel-" + key);
+    const card = document.getElementById("card-" + key);
+    if (panel && panel.classList.contains("open")) {
+        panel.classList.remove("open");
+        if (card) card.classList.remove("active");
+        if (openPanel === key) openPanel = null;
+    }
+}
+
 async function loadStatus() {
     try {
         const r = await fetch(API + "/api/status");
@@ -1693,7 +1812,7 @@ async function stLogin() {
     try {
         const r = await fetch(API + "/api/login/st", { method: "POST", body: JSON.stringify({ email, password: pw }) });
         const j = await r.json();
-        if (j.ok) { document.getElementById("stPassword").value = ""; await loadStatus(); }
+        if (j.ok) { document.getElementById("stPassword").value = ""; closePanel("st"); await loadStatus(); }
         else alert(t("loginFailed"));
     } catch (e) { alert(t("error") + ": " + e.message); }
     document.getElementById("stSpinner").classList.add("hidden");
@@ -1710,7 +1829,7 @@ async function fsLoginAction() {
     try {
         const r = await fetch(API + "/api/login/fs", { method: "POST", body: JSON.stringify({ username: user, password: pw }) });
         const j = await r.json();
-        if (j.ok) { document.getElementById("fsPassword").value = ""; await loadStatus(); }
+        if (j.ok) { document.getElementById("fsPassword").value = ""; closePanel("fs"); await loadStatus(); }
         else alert(t("loginFailed"));
     } catch (e) { alert(t("error") + ": " + e.message); }
     document.getElementById("fsSpinner").classList.add("hidden");
@@ -1727,7 +1846,7 @@ async function wsLoginAction() {
     try {
         const r = await fetch(API + "/api/login/ws", { method: "POST", body: JSON.stringify({ username: user, password: pw }) });
         const j = await r.json();
-        if (j.ok) { document.getElementById("wsPassword").value = ""; await loadStatus(); }
+        if (j.ok) { document.getElementById("wsPassword").value = ""; closePanel("ws"); await loadStatus(); }
         else alert(t("loginFailed"));
     } catch (e) { alert(t("error") + ": " + e.message); }
     document.getElementById("wsSpinner").classList.add("hidden");
@@ -1744,7 +1863,7 @@ async function ptLoginAction() {
     try {
         const r = await fetch(API + "/api/login/pt", { method: "POST", body: JSON.stringify({ email, password: pw }) });
         const j = await r.json();
-        if (j.ok) { document.getElementById("ptPassword").value = ""; await loadStatus(); }
+        if (j.ok) { document.getElementById("ptPassword").value = ""; closePanel("pt"); await loadStatus(); }
         else alert(t("loginFailed"));
     } catch (e) { alert(t("error") + ": " + e.message); }
     document.getElementById("ptSpinner").classList.add("hidden");
@@ -1876,6 +1995,8 @@ document.getElementById("lang-" + lang).classList.add("active");
 document.querySelectorAll(".lang-btn").forEach(b => { if (b.id !== "lang-" + lang) b.classList.remove("active"); });
 applyStrings();
 loadStatus();
+// Background logins finish after page load - keep the status fresh
+setInterval(loadStatus, 10000);
 </script>
 </body>
 </html>`;
@@ -1895,7 +2016,7 @@ function parseImdbId(id) {
 // --- SledujTeTo addon ---
 const stManifest = {
     id: "cz.sledujteto.stremio",
-    version: "2.3.0",
+    version: "2.4.0",
     name: "SledujTeTo.cz",
     description: "SledujTeTo.cz pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -1937,17 +2058,18 @@ stBuilder.defineStreamHandler(async ({ type, id }) => {
     }
     if (id.startsWith("tt")) {
         const { imdbId, season, episode } = parseImdbId(id);
-        const results = await searchStForImdb(imdbId, season, episode);
-        const streams = [];
-        for (const item of results) {
+        // Cap + parallel resolve - serial resolution of every result used to
+        // risk Stremio timeouts on titles with many hits.
+        const results = (await searchStForImdb(imdbId, season, episode)).slice(0, 30);
+        const resolved = await Promise.all(results.map(async item => {
             const vid = item.id.replace("sleduj:", "");
             const info = await getStreamInfo(vid);
-            if (info) {
-                const fd = fileDataCache[vid];
-                const name = fd?.name || "";
-                streams.push({ url: `http://127.0.0.1:${PROXY_PORT}/proxy/${vid}`, name: `${stLabel()}\n${stFormatName(name, fd, imdbId)}`, description: stFormatDesc(name, fd), behaviorHints: { notWebReady: true } });
-            }
-        }
+            if (!info) return null;
+            const fd = fileDataCache[vid];
+            const name = fd?.name || "";
+            return { url: `http://127.0.0.1:${PROXY_PORT}/proxy/${vid}`, name: `${stLabel()}\n${stFormatName(name, fd, imdbId)}`, description: stFormatDesc(name, fd), behaviorHints: { notWebReady: true } };
+        }));
+        const streams = resolved.filter(Boolean);
         console.log(`[STREAM] ST ${id}: ${streams.length} streams`);
         return { streams };
     }
@@ -1957,7 +2079,7 @@ stBuilder.defineStreamHandler(async ({ type, id }) => {
 // --- Fastshare addon ---
 const fsManifest = {
     id: "cz.fastshare.stremio",
-    version: "2.3.0",
+    version: "2.4.0",
     name: "Fastshare.cz",
     description: "Fastshare.cz pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -2008,7 +2130,7 @@ fsBuilder.defineStreamHandler(async ({ type, id }) => {
 // --- Hellspy addon ---
 const hsManifest = {
     id: "cz.hellspy.stremio",
-    version: "2.3.0",
+    version: "2.4.0",
     name: "Hellspy.to",
     description: "Hellspy.to pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -2059,7 +2181,7 @@ hsBuilder.defineStreamHandler(async ({ type, id }) => {
 // --- Webshare addon ---
 const wsManifest = {
     id: "cz.webshare.stremio",
-    version: "2.3.0",
+    version: "2.4.0",
     name: "Webshare.cz",
     description: "Webshare.cz pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -2090,23 +2212,20 @@ wsBuilder.defineStreamHandler(async ({ type, id }) => {
     if (!serverRunning) return { streams: [] };
     if (id.startsWith("ws:")) {
         const f = wsFileCache[id.replace("ws:", "")];
-        if (f) {
-            const link = await wsGetLink(f.wsId);
-            if (link) return { streams: [{ url: link, name: `${wsLabel()}\n${wsFormatName(f)}`, description: wsFormatDesc(f) }] };
-        }
+        if (f) return { streams: [{ url: `http://127.0.0.1:${PROXY_PORT}/wsproxy/${encodeURIComponent(f.wsId)}`, name: `${wsLabel()}\n${wsFormatName(f)}`, description: wsFormatDesc(f), behaviorHints: { notWebReady: true } }] };
         return { streams: [] };
     }
     if (id.startsWith("tt")) {
         const { imdbId, season, episode } = parseImdbId(id);
         const results = await searchWsForImdb(imdbId, season, episode);
         enhanceAudioByTitle(results, "name", imdbId);
-        const streams = [];
-        for (const f of results) {
-            const link = await wsGetLink(f.wsId);
-            if (link) {
-                streams.push({ url: link, name: `${wsLabel()}\n${wsFormatName(f)}`, description: wsFormatDesc(f) });
-            }
-        }
+        // Direct link is resolved lazily via /wsproxy at playback time -
+        // no N sequential file_link calls before returning the list.
+        const streams = results.map(f => ({
+            url: `http://127.0.0.1:${PROXY_PORT}/wsproxy/${encodeURIComponent(f.wsId)}`,
+            name: `${wsLabel()}\n${wsFormatName(f)}`, description: wsFormatDesc(f),
+            behaviorHints: { notWebReady: true },
+        }));
         console.log(`[STREAM] WS ${id}: ${streams.length} streams`);
         return { streams };
     }
@@ -2116,7 +2235,7 @@ wsBuilder.defineStreamHandler(async ({ type, id }) => {
 // --- PrehrajTo addon ---
 const ptManifest = {
     id: "cz.prehrajto.stremio",
-    version: "2.3.0",
+    version: "2.4.0",
     name: "Prehraj.to",
     description: "Prehraj.to pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -2287,53 +2406,55 @@ function startAddonServer() {
 
 // ============ START ============
 
+// Log in to all services using saved credentials (in parallel).
+// Also used by the periodic re-login timer to refresh expired sessions.
+async function loginAllFromConfig() {
+    const jobs = [];
+    if (config.stEmail && config.stPassword) jobs.push(login(config.stEmail, config.stPassword));
+    else console.log("[LOGIN] SledujTeTo: žiadne uložené údaje - otvorte /configure");
+    if (config.fsUsername && config.fsPassword) jobs.push(fsLogin(config.fsUsername, config.fsPassword));
+    else console.log("[LOGIN] Fastshare: žiadne uložené údaje - otvorte /configure");
+    if (config.wsUsername && config.wsPassword) jobs.push(wsLogin(config.wsUsername, config.wsPassword));
+    else console.log("[LOGIN] Webshare: žiadne uložené údaje - otvorte /configure");
+    if (config.ptEmail && config.ptPassword) jobs.push(ptLogin(config.ptEmail, config.ptPassword));
+    else console.log("[LOGIN] Prehraj.to: žiadne uložené údaje - otvorte /configure");
+    await Promise.allSettled(jobs);
+}
+
 async function start() {
-    // SledujTeTo login from config
-    if (config.stEmail && config.stPassword) {
-        await login(config.stEmail, config.stPassword);
-    } else {
-        console.log("[LOGIN] SledujTeTo: žiadne uložené údaje - otvorte /configure");
-    }
-
-    // Fastshare login from config
-    if (config.fsUsername && config.fsPassword) {
-        await fsLogin(config.fsUsername, config.fsPassword);
-    } else {
-        console.log("[LOGIN] Fastshare: žiadne uložené údaje - otvorte /configure");
-    }
-
-    // Webshare login from config
-    if (config.wsUsername && config.wsPassword) {
-        await wsLogin(config.wsUsername, config.wsPassword);
-    } else {
-        console.log("[LOGIN] Webshare: žiadne uložené údaje - otvorte /configure");
-    }
-
-    // PrehrajTo login from config
-    if (config.ptEmail && config.ptPassword) {
-        await ptLogin(config.ptEmail, config.ptPassword);
-    } else {
-        console.log("[LOGIN] Prehraj.to: žiadne uložené údaje - otvorte /configure");
-    }
-
-    // Preload
-    console.log("[PRELOAD] Loading catalog...");
-    for (const q of ["2025", "2024", "CZ", "SK"]) {
-        for (let p = 1; p <= 2; p++) await fetchVideos(q, p);
-    }
-    console.log(`[PRELOAD] Cached ${Object.keys(urlCache).length} URLs`);
-
+    // Servers start FIRST so /configure is available immediately -
+    // logins and catalog preload run in the background.
     startProxyServer();
     startAddonServer();
+
+    (async () => {
+        await loginAllFromConfig();
+
+        // Preload (in parallel)
+        console.log("[PRELOAD] Loading catalog...");
+        const preloads = [];
+        for (const q of ["2025", "2024", "CZ", "SK"]) {
+            for (let p = 1; p <= 2; p++) preloads.push(fetchVideos(q, p));
+        }
+        await Promise.allSettled(preloads);
+        console.log(`[PRELOAD] Cached ${Object.keys(urlCache).length} URLs`);
+        console.log(`SledujTeTo premium: ${stPremium ? "✓" : "✗"}`);
+        console.log(`Fastshare unlimited: ${fsUnlimited ? "✓" : "✗"}`);
+        console.log(`Webshare VIP: ${wsVip ? "✓" : "✗"}`);
+    })().catch(e => console.error("[START] Background init error:", e.message));
+
+    // Sessions/tokens expire over time - refresh them every 6 hours
+    setInterval(() => {
+        console.log("[RELOGIN] Periodic session refresh...");
+        loginAllFromConfig().catch(e => console.error("[RELOGIN] Error:", e.message));
+    }, 6 * 3600 * 1000);
+
     console.log(`\n========================================`);
     console.log(`SledujTeTo:  http://127.0.0.1:${ADDON_PORT}/st/manifest.json`);
     console.log(`Fastshare:   http://127.0.0.1:${ADDON_PORT}/fs/manifest.json`);
     console.log(`Hellspy:     http://127.0.0.1:${ADDON_PORT}/hs/manifest.json`);
     console.log(`Webshare:    http://127.0.0.1:${ADDON_PORT}/ws/manifest.json`);
     console.log(`Prehraj.to:  http://127.0.0.1:${ADDON_PORT}/pt/manifest.json`);
-    console.log(`SledujTeTo premium: ${stPremium ? "✓" : "✗"}`);
-    console.log(`Fastshare unlimited: ${fsUnlimited ? "✓" : "✗"}`);
-    console.log(`Webshare VIP: ${wsVip ? "✓" : "✗"}`);
     console.log(`========================================`);
 }
 
