@@ -10,7 +10,9 @@ const API_URL = `${BASE_URL}/api/web`;
 const PROXY_PORT = 7516;
 const ADDON_PORT = 7515;
 const TMDB_API_KEY = "6886604aa36c09e80400a8732d061684";
-const CONFIG_PATH = path.join(__dirname, "config.json");
+// Portable build passes STREAMHUB_CONFIG_DIR (the folder next to the exe),
+// so logins survive even though the app code is unpacked into a temp dir.
+const CONFIG_PATH = path.join(process.env.STREAMHUB_CONFIG_DIR || __dirname, "config.json");
 
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
