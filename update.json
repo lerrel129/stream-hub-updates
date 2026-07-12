@@ -1,7 +1,7 @@
 {
-  "version": 9,
+  "version": 14,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.0: fast startup, parallel search, accurate SK/CZ flags, auto re-login, memory limit, OTA rollback",
-  "apkVersion": 20,
+  "notes": "v2.1: install addons straight into your Stremio account (syncs to phone & TV, bypasses the http block); LAN mode",
+  "apkVersion": 25,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
