@@ -1,7 +1,7 @@
 {
-  "version": 13,
+  "version": 9,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.3: fix 'failed to fetch' - the Add button hands out the address the page was opened with (localhost locally), Stremio http restriction explained in UI",
-  "apkVersion": 24,
+  "notes": "v2.0: fast startup, parallel search, accurate SK/CZ flags, auto re-login, memory limit, OTA rollback",
+  "apkVersion": 20,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
