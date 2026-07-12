@@ -1,7 +1,7 @@
 {
-  "version": 11,
+  "version": 12,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.1: LAN mode - the Add button hands out the network-wide addon address; server bar shows the server IP",
-  "apkVersion": 22,
+  "notes": "v2.2: hostname toggle - addon URLs can use the device name (.local) instead of IP, so they survive IP changes",
+  "apkVersion": 23,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }

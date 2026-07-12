@@ -17,7 +17,7 @@ const CONFIG_PATH = path.join(process.env.STREAMHUB_CONFIG_DIR || __dirname, "co
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 11;
+const APP_VERSION = 12;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1020,6 +1020,13 @@ function getLanIps() {
     return ips;
 }
 
+// mDNS name of this device (e.g. "my-pc.local") - survives IP changes.
+// Used by the Add button when config.useHostname is enabled.
+function getLanHostname() {
+    let h = os.hostname().toLowerCase().replace(/\.local$/, "").replace(/[^a-z0-9-]/g, "-");
+    return h + ".local";
+}
+
 // Responses contain absolute URLs pointing at 127.0.0.1 (stream/proxy/addon
 // links). When a LAN client requests them, rewrite to the host it used, so
 // the links work on that device too.
@@ -1148,6 +1155,8 @@ function startProxyServer() {
                 serverRunning,
                 lanMode: !!config.lanMode,
                 lanIps: getLanIps(),
+                lanHostname: getLanHostname(),
+                useHostname: !!config.useHostname,
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
                 fs: { loggedIn: fsLoggedIn, unlimited: fsUnlimited, user: fsUser },
                 ws: { loggedIn: wsLoggedIn, vip: wsVip, user: wsUser },
@@ -1162,6 +1171,26 @@ function startProxyServer() {
             };
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
             res.end(rewriteLocalUrls(JSON.stringify(status), req));
+            return;
+        }
+
+        // ---- HOSTNAME TOGGLE (use device name instead of IP in addon URLs) ----
+        if (req.url === "/api/hostname" && req.method === "POST") {
+            let body = "";
+            req.on("data", c => body += c);
+            req.on("end", () => {
+                try {
+                    const { enabled } = JSON.parse(body);
+                    config.useHostname = !!enabled;
+                    saveConfig(config);
+                    console.log(`[LAN] Hostname mode ${config.useHostname ? "ENABLED (" + getLanHostname() + ")" : "disabled"}`);
+                    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: true, useHostname: config.useHostname, lanHostname: getLanHostname() }));
+                } catch (e) {
+                    res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
             return;
         }
 
@@ -1656,6 +1685,13 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
         </div>
         <button class="update-btn" id="lanBtn" onclick="lanToggle()">...</button>
     </div>
+    <div class="update-bar" id="hostBar">
+        <div class="update-info">
+            <span class="update-title" id="hostTitle">Názov namiesto IP</span>
+            <span class="update-status" id="hostStatus">...</span>
+        </div>
+        <button class="update-btn" id="hostBtn" onclick="hostToggle()">...</button>
+    </div>
     <div id="lanUrls" style="font-size:11px; color:#9ca3af; padding:0 6px 10px; word-break:break-all; line-height:1.6;"></div>
 </div>
 
@@ -1707,6 +1743,8 @@ const T = {
         lanHintAdd: "Tlačidlo „Pridať“ teraz pridáva adresu doplnku dostupnú v celej sieti (iPhone, TV...).",
         lanWarn: "Pozor: server bude dostupný pre všetky zariadenia v domácej sieti.",
         serverRunningAt: "Server beží na",
+        hostTitle: "Názov namiesto IP", hostOn: "Zapnutý",
+        hostHint: "Adresy používajú názov zariadenia – fungujú aj po zmene IP. Niektoré TV .local adresy nepodporujú.",
     },
     cz: {
         serverStopped: "Server zastaven", serverRunning: "Server běží", serverUnavailable: "Server nedostupný",
@@ -1729,6 +1767,8 @@ const T = {
         lanHintAdd: "Tlačítko „Přidat“ nyní přidává adresu doplňku dostupnou v celé síti (iPhone, TV...).",
         lanWarn: "Pozor: server bude dostupný pro všechna zařízení v domácí síti.",
         serverRunningAt: "Server běží na",
+        hostTitle: "Název místo IP", hostOn: "Zapnutý",
+        hostHint: "Adresy používají název zařízení – fungují i po změně IP. Některé TV .local adresy nepodporují.",
     },
     en: {
         serverStopped: "Server stopped", serverRunning: "Server running", serverUnavailable: "Server unavailable",
@@ -1751,6 +1791,8 @@ const T = {
         lanHintAdd: "The Add button now hands out the network-wide addon address (iPhone, TV...).",
         lanWarn: "Warning: the server will be reachable by every device on your home network.",
         serverRunningAt: "Server running on",
+        hostTitle: "Hostname instead of IP", hostOn: "Enabled",
+        hostHint: "Addresses use the device name - they keep working after an IP change. Some TVs do not support .local addresses.",
     }
 };
 let lang = localStorage.getItem("lang") || "sk";
@@ -1808,23 +1850,44 @@ function applyStrings() {
 
     // LAN panel
     document.getElementById("lanTitle").textContent = t("lanTitle");
+    document.getElementById("hostTitle").textContent = t("hostTitle");
     renderLanUI();
 }
 
 // ---- LAN mode ----
 let lanMode = false;
 let lanIps = [];
+let lanHostname = "";
+let useHostname = false;
 
 function renderLanUI() {
     document.getElementById("lanStatus").textContent = lanMode ? t("lanOn") : t("lanOff");
     document.getElementById("lanStatus").style.color = lanMode ? "#34d399" : "#9ca3af";
     document.getElementById("lanBtn").textContent = lanMode ? t("lanDisable") : t("lanEnable");
+
+    // Hostname toggle - only meaningful while LAN mode is on
+    document.getElementById("hostBar").style.opacity = lanMode ? "1" : "0.45";
+    document.getElementById("hostBtn").disabled = !lanMode;
+    document.getElementById("hostStatus").textContent = useHostname ? (t("hostOn") + (lanHostname ? " (" + lanHostname + ")" : "")) : t("lanOff");
+    document.getElementById("hostStatus").style.color = useHostname ? "#34d399" : "#9ca3af";
+    document.getElementById("hostBtn").textContent = useHostname ? t("lanDisable") : t("lanEnable");
+
     const urls = document.getElementById("lanUrls");
     if (lanMode && lanIps.length) {
-        urls.innerHTML = t("lanHintAdd") + "<br>" + t("lanWarn");
+        urls.innerHTML = t("lanHintAdd") + "<br>" + (useHostname ? t("hostHint") + "<br>" : "") + t("lanWarn");
     } else {
         urls.textContent = "";
     }
+}
+
+async function hostToggle() {
+    const btn = document.getElementById("hostBtn");
+    btn.disabled = true;
+    try {
+        await fetch(API + "/api/hostname", { method: "POST", body: JSON.stringify({ enabled: !useHostname }) });
+    } catch (e) {}
+    await loadStatus();
+    btn.disabled = !lanMode;
 }
 
 async function lanToggle() {
@@ -1864,12 +1927,16 @@ async function loadStatus() {
 
         lanMode = !!s.lanMode;
         lanIps = s.lanIps || [];
+        lanHostname = s.lanHostname || "";
+        useHostname = !!s.useHostname;
         renderLanUI();
 
         const running = s.serverRunning;
         document.getElementById("serverDot").className = "dot " + (running ? "dot-green" : "dot-red");
         let runLabel = t("serverRunning");
-        if (running && lanMode && lanIps.length) runLabel = t("serverRunningAt") + " " + lanIps[0];
+        if (running && lanMode && lanIps.length) {
+            runLabel = t("serverRunningAt") + " " + ((useHostname && lanHostname) ? lanHostname : lanIps[0]);
+        }
         document.getElementById("serverLabel").textContent = running ? runLabel : t("serverStopped");
         document.getElementById("serverLabel").style.color = running ? "#34d399" : "#f87171";
         document.getElementById("serverToggle").textContent = running ? t("stop") : t("start");
@@ -2018,8 +2085,12 @@ function installOne(key) {
     let url = addonUrls[key];
     if (!url) return;
     // In LAN mode the Add button hands out the network-wide address,
-    // so the addon works in Stremio on any device in the LAN.
-    if (lanMode && lanIps.length) url = url.replace("127.0.0.1", lanIps[0]);
+    // so the addon works in Stremio on any device in the LAN. With the
+    // hostname toggle on, the device name is used - survives IP changes.
+    if (lanMode) {
+        const host = (useHostname && lanHostname) ? lanHostname : (lanIps.length ? lanIps[0] : null);
+        if (host) url = url.replace("127.0.0.1", host);
+    }
     navigator.clipboard.writeText(url).then(() => {
         window.open("stremio://" + url.replace(/^https?:\\/\\//, ""), "_blank");
     });
