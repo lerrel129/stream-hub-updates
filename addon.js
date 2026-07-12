@@ -15,7 +15,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 16;
+const APP_VERSION = 17;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1063,6 +1063,21 @@ async function stremioGetAddons(authKey) {
     return (coll && coll.addons) || [];
 }
 
+// Which of our addons are already in the account for the given host.
+// Cached briefly so the /configure status poll doesn't hammer the Stremio API.
+let installedCache = { ts: 0, host: "", keys: [] };
+async function stremioInstalledKeys(authKey, host) {
+    if (Date.now() - installedCache.ts < 20000 && installedCache.host === host) return installedCache.keys;
+    const addons = await stremioGetAddons(authKey);
+    const keys = [];
+    for (const k of ["st", "fs", "hs", "ws", "pt"]) {
+        const re = new RegExp(`//${host.replace(/\./g, "\\.")}:${ADDON_PORT}/${k}/manifest\\.json$`);
+        if (addons.some(a => re.test((a && a.transportUrl) || ""))) keys.push(k);
+    }
+    installedCache = { ts: Date.now(), host, keys };
+    return keys;
+}
+
 // Push selected Stream Hub addons (LAN URLs) into the account, replacing any
 // previous Stream Hub entries so re-installing doesn't create duplicates.
 async function stremioInstall(authKey, host, keys) {
@@ -1082,6 +1097,7 @@ async function stremioInstall(authKey, host, keys) {
         });
     }
     await stremioApi("addonCollectionSet", { authKey, addons });
+    installedCache.ts = 0; // force a refresh of the installed-keys list
     return keys.length;
 }
 
@@ -1254,8 +1270,24 @@ function startProxyServer() {
         // ---- STREMIO ACCOUNT: logout ----
         if (req.url === "/api/stremio/logout" && req.method === "POST") {
             delete config.stremioAuthKey; delete config.stremioUser; saveConfig(config);
+            installedCache = { ts: 0, host: "", keys: [] };
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
             res.end(JSON.stringify({ ok: true }));
+            return;
+        }
+
+        // ---- STREMIO ACCOUNT: which of our addons are already in the account ----
+        if (req.url === "/api/stremio/installed") {
+            res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+            try {
+                if (!config.stremioAuthKey) { res.end(JSON.stringify({ ok: true, keys: [] })); return; }
+                const ips = getLanIps();
+                const host = config.lanMode && ips.length ? ips[0] : "127.0.0.1";
+                const keys = await stremioInstalledKeys(config.stremioAuthKey, host);
+                res.end(JSON.stringify({ ok: true, keys }));
+            } catch (e) {
+                res.end(JSON.stringify({ ok: false, keys: [], error: e.message }));
+            }
             return;
         }
 
@@ -1537,9 +1569,8 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
 .card-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .card-actions .btn-add, .card-actions .btn-login-card { padding: 8px 16px; border: none; border-radius: 12px; font-size: 12px; cursor: pointer; font-weight: bold; color: #fff; background: #4a9c4f; transition: background 0.15s; }
 .card-actions .btn-add:hover, .card-actions .btn-login-card:hover { background: #3d8b40; }
-.card-actions .btn-add.mode-account { background: #6366f1; }
-.card-actions .btn-add.mode-account:hover { background: #4f46e5; }
 .card-actions .btn-add:disabled { opacity: 0.5; cursor: default; }
+.card-actions .btn-installed { padding: 8px 16px; border: none; border-radius: 12px; font-size: 12px; font-weight: bold; color: #34d399; background: transparent; cursor: default; }
 .card-badge { font-size: 14px; display: inline-block; line-height: 1; }
 .card-badge:empty { display: none; }
 
@@ -1819,7 +1850,7 @@ const T = {
         lanWarn: "Server bude dostupný pre všetky zariadenia v sieti.",
         strTitle: "Inštalovať do Stremio účtu",
         strHelp: "Prihlás sa do svojho Stremio účtu – doplnky sa zapíšu priamo do účtu a nasynchronizujú na telefón aj TV (obíde to blokovanie http). Zapni najprv „Prístup zo siete“.",
-        strAddOne: "Do účtu", strInstalling: "Pridávam...",
+        installed: "Nainštalované", strAddOne: "Do účtu", strInstalling: "Pridávam...",
         strInstalled: "Hotovo – pridané do účtu. Otvor Stremio na TV/telefóne.",
         strUseCards: "Tlačidlo „Pridať“ teraz pridáva doplnky priamo do Stremio účtu.",
         strNeedLan: "Najprv zapni „Prístup zo siete (LAN)“.",
@@ -1846,7 +1877,7 @@ const T = {
         lanWarn: "Server bude dostupný pro všechna zařízení v síti.",
         strTitle: "Instalovat do Stremio účtu",
         strHelp: "Přihlas se do svého Stremio účtu – doplňky se zapíšou přímo do účtu a nasynchronizují na telefon i TV (obejde to blokování http). Zapni nejdřív „Přístup ze sítě“.",
-        strAddOne: "Do účtu", strInstalling: "Přidávám...",
+        installed: "Nainstalováno", strAddOne: "Do účtu", strInstalling: "Přidávám...",
         strInstalled: "Hotovo – přidáno do účtu. Otevři Stremio na TV/telefonu.",
         strUseCards: "Tlačítko „Přidat“ teď přidává doplňky přímo do Stremio účtu.",
         strNeedLan: "Nejdřív zapni „Přístup ze sítě (LAN)“.",
@@ -1873,7 +1904,7 @@ const T = {
         lanWarn: "The server will be reachable by every device on the network.",
         strTitle: "Install into Stremio account",
         strHelp: "Sign in to your Stremio account - the addons are written straight into the account and sync to your phone and TV (this bypasses the http block). Turn on Network access first.",
-        strAddOne: "To account", strInstalling: "Adding...",
+        installed: "Installed", strAddOne: "To account", strInstalling: "Adding...",
         strInstalled: "Done - added to your account. Open Stremio on your TV/phone.",
         strUseCards: "The Add button now adds addons straight into your Stremio account.",
         strNeedLan: "Turn on Network access (LAN) first.",
@@ -1950,13 +1981,31 @@ function renderLanUI() {
     document.getElementById("lanBtn").textContent = lanMode ? t("lanDisable") : t("lanEnable");
 }
 
-// In account mode (LAN + Stremio signed in) the Add button installs into the
-// account and is styled/labelled accordingly; otherwise it's the local Add.
+// The Add button keeps its label/colour. In account mode (LAN + Stremio
+// signed in) it installs into the account; if the addon is already in the
+// account it shows "Nainštalované" instead.
+let installedKeys = [];
+async function refreshInstalled() {
+    try {
+        const r = await fetch(API + "/api/stremio/installed");
+        const j = await r.json();
+        installedKeys = (j && j.keys) || [];
+    } catch (e) { /* keep previous */ }
+}
 function updateAddButtons() {
     const account = lanMode && stremioLoggedIn;
-    document.querySelectorAll(".btn-add").forEach(b => {
-        b.textContent = account ? t("strAddOne") : t("add");
-        b.classList.toggle("mode-account", account);
+    ["hs", "pt", "st", "fs", "ws"].forEach(k => {
+        const b = document.querySelector("#card-" + k + " .btn-add");
+        if (!b) return;
+        if (account && installedKeys.indexOf(k) !== -1) {
+            b.textContent = t("installed");
+            b.classList.add("btn-installed");
+            b.disabled = true;
+        } else {
+            b.textContent = t("add");
+            b.classList.remove("btn-installed");
+            b.disabled = false;
+        }
     });
 }
 
@@ -2014,7 +2063,8 @@ async function accountInstall(key) {
         const j = await r.json();
         if (j.ok) {
             if (btn) btn.textContent = "✓";
-            setTimeout(() => { if (btn) { btn.textContent = original; btn.disabled = false; } }, 1800);
+            await refreshInstalled();
+            setTimeout(() => { updateAddButtons(); }, 1200);
             return;
         }
         alert(t("error") + (j.error ? ": " + j.error : ""));
@@ -2063,14 +2113,15 @@ async function loadStatus() {
             document.getElementById("stremioAuthKey").classList.add("hidden");
             // Per-addon install works only with LAN on; guide the user otherwise
             if (!lanMode) { strMsg.style.color = "#fbbf24"; strMsg.textContent = t("strNeedLan"); }
-            else { strMsg.style.color = "#9ca3af"; strMsg.textContent = t("strUseCards"); }
+            else if (!strMsg.dataset.keep) { strMsg.textContent = ""; }
         } else {
             document.getElementById("stremioLoginBtn").classList.remove("hidden");
             document.getElementById("stremioLogoutBtn").classList.add("hidden");
             document.getElementById("stremioPassword").classList.remove("hidden");
             document.getElementById("stremioAuthKey").classList.remove("hidden");
         }
-        // "Pridať" buttons switch to account mode when LAN + Stremio are active
+        // Detect which addons are already in the account (shows "Nainštalované")
+        if (lanMode && stremioLoggedIn) { await refreshInstalled(); } else { installedKeys = []; }
         updateAddButtons();
 
         const running = s.serverRunning;

@@ -1,7 +1,7 @@
 {
-  "version": 16,
+  "version": 17,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.3: the Add button installs into your Stremio account when LAN + Stremio login are active (per-addon), simpler UI",
-  "apkVersion": 27,
+  "notes": "v2.4: Add button stays green; addons already in your Stremio account show 'Nainštalované'",
+  "apkVersion": 28,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
