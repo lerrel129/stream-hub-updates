@@ -17,7 +17,7 @@ const CONFIG_PATH = path.join(process.env.STREAMHUB_CONFIG_DIR || __dirname, "co
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 12;
+const APP_VERSION = 13;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1740,7 +1740,8 @@ const T = {
         appUpdTitle: "Nová verzia aplikácie", appUpdBtn: "Stiahnuť APK",
         lanTitle: "Prístup zo siete (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnúť", lanDisable: "Vypnúť",
-        lanHintAdd: "Tlačidlo „Pridať“ teraz pridáva adresu doplnku dostupnú v celej sieti (iPhone, TV...).",
+        lanHintAdd: "Na inom zariadení otvorte v prehliadači túto adresu a stlačte „Pridať“:",
+        lanHttpWarn: "Upozornenie: Stremio blokuje http doplnky mimo tohto zariadenia (vyžaduje HTTPS) – inštalácia z iného zariadenia nemusí prejsť.",
         lanWarn: "Pozor: server bude dostupný pre všetky zariadenia v domácej sieti.",
         serverRunningAt: "Server beží na",
         hostTitle: "Názov namiesto IP", hostOn: "Zapnutý",
@@ -1764,7 +1765,8 @@ const T = {
         appUpdTitle: "Nová verze aplikace", appUpdBtn: "Stáhnout APK",
         lanTitle: "Přístup ze sítě (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnout", lanDisable: "Vypnout",
-        lanHintAdd: "Tlačítko „Přidat“ nyní přidává adresu doplňku dostupnou v celé síti (iPhone, TV...).",
+        lanHintAdd: "Na jiném zařízení otevřete v prohlížeči tuto adresu a stiskněte „Přidat“:",
+        lanHttpWarn: "Upozornění: Stremio blokuje http doplňky mimo toto zařízení (vyžaduje HTTPS) – instalace z jiného zařízení nemusí projít.",
         lanWarn: "Pozor: server bude dostupný pro všechna zařízení v domácí síti.",
         serverRunningAt: "Server běží na",
         hostTitle: "Název místo IP", hostOn: "Zapnutý",
@@ -1788,7 +1790,8 @@ const T = {
         appUpdTitle: "New app version", appUpdBtn: "Download APK",
         lanTitle: "Network access (LAN)", lanOn: "Enabled", lanOff: "Disabled",
         lanEnable: "Enable", lanDisable: "Disable",
-        lanHintAdd: "The Add button now hands out the network-wide addon address (iPhone, TV...).",
+        lanHintAdd: "On another device open this address in a browser and press Add:",
+        lanHttpWarn: "Note: Stremio blocks http addons from non-localhost addresses (HTTPS required) - installing from another device may not work.",
         lanWarn: "Warning: the server will be reachable by every device on your home network.",
         serverRunningAt: "Server running on",
         hostTitle: "Hostname instead of IP", hostOn: "Enabled",
@@ -1874,7 +1877,9 @@ function renderLanUI() {
 
     const urls = document.getElementById("lanUrls");
     if (lanMode && lanIps.length) {
-        urls.innerHTML = t("lanHintAdd") + "<br>" + (useHostname ? t("hostHint") + "<br>" : "") + t("lanWarn");
+        const host = (useHostname && lanHostname) ? lanHostname : lanIps[0];
+        urls.innerHTML = t("lanHintAdd") + "<br><b>http://" + host + ":${ADDON_PORT}/configure</b><br>" +
+            (useHostname ? t("hostHint") + "<br>" : "") + t("lanHttpWarn") + "<br>" + t("lanWarn");
     } else {
         urls.textContent = "";
     }
@@ -2082,15 +2087,13 @@ async function toggleServer() {
 }
 
 function installOne(key) {
-    let url = addonUrls[key];
+    const url = addonUrls[key];
     if (!url) return;
-    // In LAN mode the Add button hands out the network-wide address,
-    // so the addon works in Stremio on any device in the LAN. With the
-    // hostname toggle on, the device name is used - survives IP changes.
-    if (lanMode) {
-        const host = (useHostname && lanHostname) ? lanHostname : (lanIps.length ? lanIps[0] : null);
-        if (host) url = url.replace("127.0.0.1", host);
-    }
+    // The URLs from /api/status are already rewritten to the host this page
+    // was opened with (127.0.0.1 locally, the LAN address on a remote
+    // device). Stremio clients block http:// addons from non-localhost
+    // addresses (mixed content), so handing out the page's own host is the
+    // only variant that can actually install.
     navigator.clipboard.writeText(url).then(() => {
         window.open("stremio://" + url.replace(/^https?:\\/\\//, ""), "_blank");
     });
