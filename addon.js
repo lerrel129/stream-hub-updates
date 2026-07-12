@@ -15,7 +15,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 18;
+const APP_VERSION = 19;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1016,6 +1016,22 @@ function getLanIps() {
     return ips;
 }
 
+// mDNS name of this device, e.g. "lenovo_loq.local". IMPORTANT: use the exact
+// OS hostname (only strip a trailing .local) - the name advertised over mDNS
+// keeps underscores etc., so sanitising them breaks resolution.
+function getLanHostname() {
+    return os.hostname().replace(/\.local$/i, "") + ".local";
+}
+
+// Host used when writing addon URLs into the Stremio account:
+// hostname (survives IP changes) or the LAN IP, per config.useHostname.
+function accountHost() {
+    if (!config.lanMode) return "127.0.0.1";
+    if (config.useHostname) return getLanHostname();
+    const ips = getLanIps();
+    return ips.length ? ips[0] : "127.0.0.1";
+}
+
 // Absolute URLs in responses point at 127.0.0.1; when a LAN client requests
 // them, rewrite to the host it used so the links work on that device too.
 function rewriteLocalUrls(str, req) {
@@ -1203,6 +1219,8 @@ function startProxyServer() {
                 serverRunning,
                 lanMode: !!config.lanMode,
                 lanIps: getLanIps(),
+                lanHostname: getLanHostname(),
+                useHostname: !!config.useHostname,
                 stremio: { loggedIn: !!config.stremioAuthKey, user: config.stremioUser || "" },
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
                 fs: { loggedIn: fsLoggedIn, unlimited: fsUnlimited, user: fsUser },
@@ -1230,10 +1248,32 @@ function startProxyServer() {
                     const { enabled } = JSON.parse(body);
                     config.lanMode = !!enabled;
                     saveConfig(config);
+                    installedCache.ts = 0; // host changed - re-check installed addons
                     console.log(`[LAN] Mode ${config.lanMode ? "ENABLED (0.0.0.0)" : "disabled (127.0.0.1)"}`);
                     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                     res.end(JSON.stringify({ ok: true, lanMode: config.lanMode, lanIps: getLanIps() }));
                     setTimeout(() => rebindServers().catch(e => console.error("[LAN] Rebind error:", e.message)), 500);
+                } catch (e) {
+                    res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
+            return;
+        }
+
+        // ---- HOSTNAME TOGGLE (use device .local name instead of IP for account URLs) ----
+        if (req.url === "/api/hostname" && req.method === "POST") {
+            let body = "";
+            req.on("data", c => body += c);
+            req.on("end", () => {
+                try {
+                    const { enabled } = JSON.parse(body);
+                    config.useHostname = !!enabled;
+                    saveConfig(config);
+                    installedCache.ts = 0; // host changed - re-check installed addons
+                    console.log(`[LAN] Hostname mode ${config.useHostname ? "ENABLED (" + getLanHostname() + ")" : "disabled (IP)"}`);
+                    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: true, useHostname: config.useHostname, lanHostname: getLanHostname() }));
                 } catch (e) {
                     res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                     res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -1282,9 +1322,7 @@ function startProxyServer() {
             try {
                 if (/[?&]fresh=1/.test(req.url)) installedCache.ts = 0; // pull-to-refresh forces a live check
                 if (!config.stremioAuthKey) { res.end(JSON.stringify({ ok: true, keys: [] })); return; }
-                const ips = getLanIps();
-                const host = config.lanMode && ips.length ? ips[0] : "127.0.0.1";
-                const keys = await stremioInstalledKeys(config.stremioAuthKey, host);
+                const keys = await stremioInstalledKeys(config.stremioAuthKey, accountHost());
                 res.end(JSON.stringify({ ok: true, keys }));
             } catch (e) {
                 res.end(JSON.stringify({ ok: false, keys: [], error: e.message }));
@@ -1301,9 +1339,8 @@ function startProxyServer() {
                     if (!config.stremioAuthKey) throw new Error("not logged in");
                     const parsed = body ? JSON.parse(body) : {};
                     const keys = (parsed.keys && parsed.keys.length) ? parsed.keys : ["st", "fs", "hs", "ws", "pt"];
-                    // Use the LAN IP so remote devices (phone, TV) can reach the server.
-                    const ips = getLanIps();
-                    const host = config.lanMode && ips.length ? ips[0] : "127.0.0.1";
+                    // hostname (survives IP changes) or LAN IP, so remote devices reach the server
+                    const host = accountHost();
                     const count = await stremioInstall(config.stremioAuthKey, host, keys);
                     console.log(`[STREMIO] Installed ${count} addons into account (host ${host})`);
                     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -1792,6 +1829,14 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
         <button class="update-btn" id="lanBtn" onclick="lanToggle()">...</button>
     </div>
 
+    <div class="update-bar" id="hostBar">
+        <div class="update-info">
+            <span class="update-title" id="hostTitle">Názov namiesto IP</span>
+            <span class="update-status" id="hostStatus">...</span>
+        </div>
+        <button class="update-btn" id="hostBtn" onclick="hostToggle()">...</button>
+    </div>
+
     <div class="login-panel open" id="stremioBox" style="animation:none;">
         <div class="panel-title" id="stremioTitle">Inštalovať do Stremio účtu</div>
         <input type="text" id="stremioEmail" placeholder="Stremio email">
@@ -1839,6 +1884,7 @@ const T = {
         noLoginRequired: "Bez prihlásenia", notLoggedIn: "Neprihlásený", loginRequired: "Prihlásenie nutné",
         netAll: "dostupné pre všetky zariadenia", netLocal: "len toto zariadenie",
         pullRefresh: "Potiahnite pre obnovenie", pullRelease: "Pustite pre obnovenie", refreshing: "Obnovujem...",
+        hostTitle: "Názov namiesto IP",
         add: "Pridať", login: "Login", signIn: "Prihlásiť", signOut: "Odhlásiť",
         hintUsernameEmail: "Meno/Email", hintPassword: "Heslo",
         fillUsernamePassword: "Vyplňte meno a heslo", fillEmailPassword: "Vyplňte email a heslo",
@@ -1868,6 +1914,7 @@ const T = {
         noLoginRequired: "Bez přihlášení", notLoggedIn: "Nepřihlášen", loginRequired: "Přihlášení nutné",
         netAll: "dostupné pro všechna zařízení", netLocal: "jen toto zařízení",
         pullRefresh: "Táhněte pro obnovení", pullRelease: "Pusťte pro obnovení", refreshing: "Obnovuji...",
+        hostTitle: "Název místo IP",
         add: "Přidat", login: "Login", signIn: "Přihlásit", signOut: "Odhlásit",
         hintUsernameEmail: "Jméno/Email", hintPassword: "Heslo",
         fillUsernamePassword: "Vyplňte jméno a heslo", fillEmailPassword: "Vyplňte email a heslo",
@@ -1897,6 +1944,7 @@ const T = {
         noLoginRequired: "No login required", notLoggedIn: "Not logged in", loginRequired: "Login required",
         netAll: "reachable by all devices", netLocal: "this device only",
         pullRefresh: "Pull to refresh", pullRelease: "Release to refresh", refreshing: "Refreshing...",
+        hostTitle: "Hostname instead of IP",
         add: "Add", login: "Login", signIn: "Sign in", signOut: "Sign out",
         hintUsernameEmail: "Username/Email", hintPassword: "Password",
         fillUsernamePassword: "Enter username and password", fillEmailPassword: "Enter email and password",
@@ -1976,6 +2024,7 @@ function applyStrings() {
 
     // LAN + Stremio account panel
     document.getElementById("lanTitle").textContent = t("lanTitle");
+    document.getElementById("hostTitle").textContent = t("hostTitle");
     document.getElementById("stremioTitle").textContent = t("strTitle");
     renderLanUI();
 }
@@ -1983,12 +2032,21 @@ function applyStrings() {
 // ---- LAN mode ----
 let lanMode = false;
 let lanIps = [];
+let lanHostname = "";
+let useHostname = false;
 let stremioLoggedIn = false;
 
 function renderLanUI() {
     document.getElementById("lanStatus").textContent = lanMode ? t("lanOn") : t("lanOff");
     document.getElementById("lanStatus").style.color = lanMode ? "#34d399" : "#9ca3af";
     document.getElementById("lanBtn").textContent = lanMode ? t("lanDisable") : t("lanEnable");
+
+    // Hostname toggle - only meaningful while LAN mode is on
+    document.getElementById("hostBar").style.opacity = lanMode ? "1" : "0.45";
+    document.getElementById("hostBtn").disabled = !lanMode;
+    document.getElementById("hostStatus").textContent = useHostname ? (t("lanOn") + (lanHostname ? " (" + lanHostname + ")" : "")) : t("lanOff");
+    document.getElementById("hostStatus").style.color = useHostname ? "#34d399" : "#9ca3af";
+    document.getElementById("hostBtn").textContent = useHostname ? t("lanDisable") : t("lanEnable");
 }
 
 // The Add button keeps its label/colour. In account mode (LAN + Stremio
@@ -2023,7 +2081,15 @@ async function lanToggle() {
     const btn = document.getElementById("lanBtn");
     btn.disabled = true;
     try { await fetch(API + "/api/lan", { method: "POST", body: JSON.stringify({ enabled: !lanMode }) }); } catch (e) {}
-    setTimeout(async () => { await loadStatus(); btn.disabled = false; }, 1500);
+    setTimeout(async () => { await loadStatus(true); btn.disabled = false; }, 1500);
+}
+
+async function hostToggle() {
+    const btn = document.getElementById("hostBtn");
+    btn.disabled = true;
+    try { await fetch(API + "/api/hostname", { method: "POST", body: JSON.stringify({ enabled: !useHostname }) }); } catch (e) {}
+    await loadStatus(true);
+    btn.disabled = !lanMode;
 }
 
 // ---- Stremio account install ----
@@ -2112,6 +2178,8 @@ async function loadStatus(force) {
         // LAN + Stremio account
         lanMode = !!s.lanMode;
         lanIps = s.lanIps || [];
+        lanHostname = s.lanHostname || "";
+        useHostname = !!s.useHostname;
         renderLanUI();
         stremioLoggedIn = !!(s.stremio && s.stremio.loggedIn);
         const strMsg = document.getElementById("stremioMsg");
@@ -2139,8 +2207,9 @@ async function loadStatus(force) {
         let runLabel = t("serverStopped");
         if (running) {
             const inNet = lanMode && lanIps.length;
-            const ip = inNet ? lanIps[0] : "127.0.0.1";
-            runLabel = t("serverRunning") + " – " + ip + " (" + (inNet ? t("netAll") : t("netLocal")) + ")";
+            let addr = inNet ? lanIps[0] : "127.0.0.1";
+            if (inNet && useHostname && lanHostname) addr = lanHostname;
+            runLabel = t("serverRunning") + " – " + addr + " (" + (inNet ? t("netAll") : t("netLocal")) + ")";
         }
         document.getElementById("serverLabel").textContent = runLabel;
         document.getElementById("serverLabel").style.color = running ? "#34d399" : "#f87171";
