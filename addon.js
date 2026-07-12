@@ -3,6 +3,7 @@ const axios = require("axios");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 const BASE_URL = "https://www.sledujteto.cz";
 const API_URL = `${BASE_URL}/api/web`;
@@ -14,7 +15,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 9;
+const APP_VERSION = 10;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -996,6 +997,53 @@ function stLabel() { return `SledujTeTo.cz ${stPremium ? "✓" : "✗"}`; }
 function fsLabel() { return `Fastshare.cz ${fsUnlimited ? "✓" : "✗"}`; }
 function wsLabel() { return `Webshare.cz ${wsVip ? "✓" : "✗"}`; }
 
+// ============ LAN MODE ============
+
+// LAN mode (config.lanMode): when enabled the servers listen on 0.0.0.0,
+// so Stremio on iPhone / LG TV / another PC on the same network can use
+// the addons via http://<this-device-ip>:7515/... Default is OFF -
+// bound to 127.0.0.1 only, unreachable from the network.
+let proxyServer = null;
+let addonServer = null;
+
+function currentBindHost() { return config.lanMode ? "0.0.0.0" : "127.0.0.1"; }
+
+function getLanIps() {
+    const ips = [];
+    for (const list of Object.values(os.networkInterfaces())) {
+        for (const i of list || []) {
+            if (i.family === "IPv4" && !i.internal) ips.push(i.address);
+        }
+    }
+    return ips;
+}
+
+// Responses contain absolute URLs pointing at 127.0.0.1 (stream/proxy/addon
+// links). When a LAN client requests them, rewrite to the host it used, so
+// the links work on that device too.
+function rewriteLocalUrls(str, req) {
+    const host = ((req.headers && req.headers.host) || "").split(":")[0];
+    if (!host || host === "127.0.0.1" || host === "localhost") return str;
+    return str.split("127.0.0.1").join(host);
+}
+
+// Re-bind both servers after the LAN mode toggle (delayed so the HTTP
+// response for the toggle itself is delivered first).
+function rebindServers() {
+    const host = currentBindHost();
+    const rebind = (srv, port, name) => new Promise((resolve) => {
+        if (!srv) return resolve();
+        try { if (srv.closeAllConnections) srv.closeAllConnections(); } catch (e) {}
+        srv.close(() => {
+            srv.listen(port, host, () => {
+                console.log(`[${name}] Re-bound to ${host}:${port}`);
+                resolve();
+            });
+        });
+    });
+    return Promise.all([rebind(proxyServer, PROXY_PORT, "PROXY"), rebind(addonServer, ADDON_PORT, "ADDON")]);
+}
+
 // ============ PROXY ============
 
 function startProxyServer() {
@@ -1096,6 +1144,8 @@ function startProxyServer() {
         if (req.url === "/api/status") {
             const status = {
                 serverRunning,
+                lanMode: !!config.lanMode,
+                lanIps: getLanIps(),
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
                 fs: { loggedIn: fsLoggedIn, unlimited: fsUnlimited, user: fsUser },
                 ws: { loggedIn: wsLoggedIn, vip: wsVip, user: wsUser },
@@ -1109,7 +1159,29 @@ function startProxyServer() {
                 },
             };
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-            res.end(JSON.stringify(status));
+            res.end(rewriteLocalUrls(JSON.stringify(status), req));
+            return;
+        }
+
+        // ---- LAN MODE TOGGLE ----
+        if (req.url === "/api/lan" && req.method === "POST") {
+            let body = "";
+            req.on("data", c => body += c);
+            req.on("end", () => {
+                try {
+                    const { enabled } = JSON.parse(body);
+                    config.lanMode = !!enabled;
+                    saveConfig(config);
+                    console.log(`[LAN] Mode ${config.lanMode ? "ENABLED (0.0.0.0)" : "disabled (127.0.0.1)"}`);
+                    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: true, lanMode: config.lanMode, lanIps: getLanIps() }));
+                    // Re-bind after the response is delivered
+                    setTimeout(() => rebindServers().catch(e => console.error("[LAN] Rebind error:", e.message)), 500);
+                } catch (e) {
+                    res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
             return;
         }
 
@@ -1325,8 +1397,9 @@ function startProxyServer() {
 
         res.writeHead(404); res.end("Not found");
     });
-    // Bind to 127.0.0.1 only - the server must not be reachable from the network
-    proxy.listen(PROXY_PORT, "127.0.0.1", () => console.log(`[PROXY] Running on port ${PROXY_PORT}`));
+    proxyServer = proxy;
+    // 127.0.0.1 by default; 0.0.0.0 when LAN mode is enabled
+    proxy.listen(PROXY_PORT, currentBindHost(), () => console.log(`[PROXY] Running on ${currentBindHost()}:${PROXY_PORT}`));
 }
 
 function getConfigHTML() {
@@ -1574,6 +1647,14 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
         </div>
         <button class="update-btn" id="updBtn" onclick="updateAction()">Skontrolovať</button>
     </div>
+    <div class="update-bar">
+        <div class="update-info">
+            <span class="update-title" id="lanTitle">Prístup zo siete</span>
+            <span class="update-status" id="lanStatus">...</span>
+        </div>
+        <button class="update-btn" id="lanBtn" onclick="lanToggle()">...</button>
+    </div>
+    <div id="lanUrls" style="font-size:11px; color:#9ca3af; padding:0 6px 10px; word-break:break-all; line-height:1.6;"></div>
 </div>
 
 <script>
@@ -1619,6 +1700,10 @@ const T = {
         updAvailable: "Dostupná nová verzia", updError: "Kontrola zlyhala",
         updAppAvailable: "Dostupná nová verzia aplikácie",
         appUpdTitle: "Nová verzia aplikácie", appUpdBtn: "Stiahnuť APK",
+        lanTitle: "Prístup zo siete (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
+        lanEnable: "Zapnúť", lanDisable: "Vypnúť",
+        lanHint: "V Stremiu na iPhone/TV/inom zariadení pridajte addon cez:",
+        lanWarn: "Pozor: server bude dostupný pre všetky zariadenia v domácej sieti.",
     },
     cz: {
         serverStopped: "Server zastaven", serverRunning: "Server běží", serverUnavailable: "Server nedostupný",
@@ -1636,6 +1721,10 @@ const T = {
         updAvailable: "Dostupná nová verze", updError: "Kontrola selhala",
         updAppAvailable: "Dostupná nová verze aplikace",
         appUpdTitle: "Nová verze aplikace", appUpdBtn: "Stáhnout APK",
+        lanTitle: "Přístup ze sítě (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
+        lanEnable: "Zapnout", lanDisable: "Vypnout",
+        lanHint: "Ve Stremiu na iPhonu/TV/jiném zařízení přidejte addon přes:",
+        lanWarn: "Pozor: server bude dostupný pro všechna zařízení v domácí síti.",
     },
     en: {
         serverStopped: "Server stopped", serverRunning: "Server running", serverUnavailable: "Server unavailable",
@@ -1653,6 +1742,10 @@ const T = {
         updAvailable: "New version available", updError: "Check failed",
         updAppAvailable: "New app version available",
         appUpdTitle: "New app version", appUpdBtn: "Download APK",
+        lanTitle: "Network access (LAN)", lanOn: "Enabled", lanOff: "Disabled",
+        lanEnable: "Enable", lanDisable: "Disable",
+        lanHint: "In Stremio on iPhone/TV/another device add the addon via:",
+        lanWarn: "Warning: the server will be reachable by every device on your home network.",
     }
 };
 let lang = localStorage.getItem("lang") || "sk";
@@ -1707,6 +1800,38 @@ function applyStrings() {
     // Update panel
     document.getElementById("updTitle").textContent = t("updTitle");
     renderUpdateUI(); // re-render status + button in the current language
+
+    // LAN panel
+    document.getElementById("lanTitle").textContent = t("lanTitle");
+    renderLanUI();
+}
+
+// ---- LAN mode ----
+let lanMode = false;
+let lanIps = [];
+
+function renderLanUI() {
+    document.getElementById("lanStatus").textContent = lanMode ? t("lanOn") : t("lanOff");
+    document.getElementById("lanStatus").style.color = lanMode ? "#34d399" : "#9ca3af";
+    document.getElementById("lanBtn").textContent = lanMode ? t("lanDisable") : t("lanEnable");
+    const urls = document.getElementById("lanUrls");
+    if (lanMode && lanIps.length) {
+        urls.innerHTML = t("lanHint") + "<br>" +
+            lanIps.map(ip => "http://" + ip + ":${ADDON_PORT}/st/manifest.json").join("<br>") +
+            "<br>" + t("lanWarn");
+    } else {
+        urls.textContent = "";
+    }
+}
+
+async function lanToggle() {
+    const btn = document.getElementById("lanBtn");
+    btn.disabled = true;
+    try {
+        await fetch(API + "/api/lan", { method: "POST", body: JSON.stringify({ enabled: !lanMode }) });
+    } catch (e) {}
+    // the server re-binds itself - refresh the status shortly after
+    setTimeout(async () => { await loadStatus(); btn.disabled = false; }, 1500);
 }
 
 function togglePanel(key) {
@@ -1733,6 +1858,10 @@ async function loadStatus() {
         const r = await fetch(API + "/api/status");
         const s = await r.json();
         addonUrls = s.addons || {};
+
+        lanMode = !!s.lanMode;
+        lanIps = s.lanIps || [];
+        renderLanUI();
 
         const running = s.serverRunning;
         document.getElementById("serverDot").className = "dot " + (running ? "dot-green" : "dot-red");
@@ -2323,7 +2452,7 @@ function startAddonServer() {
                                 timeout: 30000, validateStatus: () => true,
                             });
                             res.writeHead(proxyResp.status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                            res.end(typeof proxyResp.data === "string" ? proxyResp.data : JSON.stringify(proxyResp.data));
+                            res.end(rewriteLocalUrls(typeof proxyResp.data === "string" ? proxyResp.data : JSON.stringify(proxyResp.data), req));
                         } catch (e) {
                             res.writeHead(502, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                             res.end(JSON.stringify({ error: e.message }));
@@ -2332,7 +2461,7 @@ function startAddonServer() {
                 } else {
                     const proxyResp = await axios.get(proxyUrl, { timeout: 30000, validateStatus: () => true });
                     res.writeHead(proxyResp.status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                    res.end(typeof proxyResp.data === "string" ? proxyResp.data : JSON.stringify(proxyResp.data));
+                    res.end(rewriteLocalUrls(typeof proxyResp.data === "string" ? proxyResp.data : JSON.stringify(proxyResp.data), req));
                 }
             } catch (e) {
                 res.writeHead(502, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -2367,7 +2496,7 @@ function startAddonServer() {
             try {
                 const result = await iface.get(resource, type, decodeURIComponent(rawId));
                 res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify(result));
+                res.end(rewriteLocalUrls(JSON.stringify(result), req));
             } catch (e) {
                 res.writeHead(500, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ error: e.message }));
@@ -2387,7 +2516,7 @@ function startAddonServer() {
             try {
                 const result = await iface.get(resource, type, decodeURIComponent(id), extra);
                 res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify(result));
+                res.end(rewriteLocalUrls(JSON.stringify(result), req));
             } catch (e) {
                 res.writeHead(500, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ error: e.message }));
@@ -2398,9 +2527,10 @@ function startAddonServer() {
         res.writeHead(404); res.end("Not found");
     });
 
-    // Bind to 127.0.0.1 only - the server must not be reachable from the network
-    server.listen(ADDON_PORT, "127.0.0.1", () => {
-        console.log(`HTTP addon accessible at: http://127.0.0.1:${ADDON_PORT}/`);
+    addonServer = server;
+    // 127.0.0.1 by default; 0.0.0.0 when LAN mode is enabled
+    server.listen(ADDON_PORT, currentBindHost(), () => {
+        console.log(`HTTP addon accessible at: http://${currentBindHost()}:${ADDON_PORT}/`);
     });
 }
 

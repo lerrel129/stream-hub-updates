@@ -1,7 +1,7 @@
 {
-  "version": 9,
+  "version": 10,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.0: fast startup, parallel search, accurate SK/CZ flags, auto re-login, memory limit, OTA rollback",
-  "apkVersion": 20,
+  "notes": "v2.1: LAN mode - use the addons in Stremio on iPhone, LG TV or any device on your home network",
+  "apkVersion": 21,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
