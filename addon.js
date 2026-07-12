@@ -15,7 +15,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 17;
+const APP_VERSION = 18;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1277,9 +1277,10 @@ function startProxyServer() {
         }
 
         // ---- STREMIO ACCOUNT: which of our addons are already in the account ----
-        if (req.url === "/api/stremio/installed") {
+        if (req.url.split("?")[0] === "/api/stremio/installed") {
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
             try {
+                if (/[?&]fresh=1/.test(req.url)) installedCache.ts = 0; // pull-to-refresh forces a live check
                 if (!config.stremioAuthKey) { res.end(JSON.stringify({ ok: true, keys: [] })); return; }
                 const ips = getLanIps();
                 const host = config.lanMode && ips.length ? ips[0] : "127.0.0.1";
@@ -1543,6 +1544,8 @@ function getConfigHTML() {
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; min-height: 100vh; display: flex; justify-content: center; padding: 24px; }
 .container { max-width: 560px; width: 100%; }
+#ptr { position: fixed; top: 0; left: 0; right: 0; height: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; color: #9ca3af; font-size: 13px; background: #0b0f19; z-index: 30; transition: height 0.15s; }
+#ptr.show { height: 44px; }
 .header { text-align: center; margin-bottom: 24px; }
 .header h1 { color: #ffffff; font-size: 28px; margin-bottom: 2px; letter-spacing: 0.5px; }
 .header .subtitle { color: #6b7280; font-size: 13px; }
@@ -1627,6 +1630,7 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
 </style>
 </head>
 <body>
+<div id="ptr"><span id="ptrText"></span></div>
 <div class="container">
     <div class="topbar">
         <button class="hamburger" onclick="toggleMenu()" aria-label="Menu">&#9776;</button>
@@ -1658,9 +1662,9 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             <div class="card-info">
                 <div class="card-name-row">
                     <div class="card-name">Prehraj.to</div>
-                    <span class="card-badge" id="badge-pt" style="color:#4a9c4f">✓</span>
+                    <span class="card-badge" id="badge-pt" style="color:#f87171">🔒</span>
                 </div>
-                <div class="card-status" id="status-pt" style="color:#34d399">Bez prihlásenia</div>
+                <div class="card-status" id="status-pt" style="color:#f87171">Prihlásenie nutné</div>
             </div>
             <div class="card-actions">
                 <button class="btn-login-card" onclick="event.stopPropagation();togglePanel('pt')">Prihlásiť</button>
@@ -1682,7 +1686,7 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             <div class="card-info">
                 <div class="card-name-row">
                     <div class="card-name">SledujTeTo.cz</div>
-                    <span class="card-badge" id="badge-st" style="color:#f87171">🔒</span>
+                    <span class="card-badge" id="badge-st" style="color:#fbbf24">💲</span>
                 </div>
                 <div class="card-status" id="status-st"><span class="dot dot-red"></span>Načítavam</div>
             </div>
@@ -1706,7 +1710,7 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             <div class="card-info">
                 <div class="card-name-row">
                     <div class="card-name">Fastshare.cz</div>
-                    <span class="card-badge" id="badge-fs" style="color:#f87171">🔒</span>
+                    <span class="card-badge" id="badge-fs" style="color:#fbbf24">💲</span>
                 </div>
                 <div class="card-status" id="status-fs"><span class="dot dot-red"></span>Načítavam</div>
             </div>
@@ -1730,7 +1734,7 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             <div class="card-info">
                 <div class="card-name-row">
                     <div class="card-name">Webshare.cz</div>
-                    <span class="card-badge" id="badge-ws" style="color:#f87171">🔒</span>
+                    <span class="card-badge" id="badge-ws" style="color:#fbbf24">💲</span>
                 </div>
                 <div class="card-status" id="status-ws"><span class="dot dot-red"></span>Načítavam</div>
             </div>
@@ -1832,7 +1836,9 @@ const T = {
     sk: {
         serverStopped: "Server zastavený", serverRunning: "Server beží", serverUnavailable: "Server nedostupný",
         start: "Spustiť", stop: "Zastaviť",
-        noLoginRequired: "Bez prihlásenia", notLoggedIn: "Neprihlásený",
+        noLoginRequired: "Bez prihlásenia", notLoggedIn: "Neprihlásený", loginRequired: "Prihlásenie nutné",
+        netAll: "dostupné pre všetky zariadenia", netLocal: "len toto zariadenie",
+        pullRefresh: "Potiahnite pre obnovenie", pullRelease: "Pustite pre obnovenie", refreshing: "Obnovujem...",
         add: "Pridať", login: "Login", signIn: "Prihlásiť", signOut: "Odhlásiť",
         hintUsernameEmail: "Meno/Email", hintPassword: "Heslo",
         fillUsernamePassword: "Vyplňte meno a heslo", fillEmailPassword: "Vyplňte email a heslo",
@@ -1859,7 +1865,9 @@ const T = {
     cz: {
         serverStopped: "Server zastaven", serverRunning: "Server běží", serverUnavailable: "Server nedostupný",
         start: "Spustit", stop: "Zastavit",
-        noLoginRequired: "Bez přihlášení", notLoggedIn: "Nepřihlášen",
+        noLoginRequired: "Bez přihlášení", notLoggedIn: "Nepřihlášen", loginRequired: "Přihlášení nutné",
+        netAll: "dostupné pro všechna zařízení", netLocal: "jen toto zařízení",
+        pullRefresh: "Táhněte pro obnovení", pullRelease: "Pusťte pro obnovení", refreshing: "Obnovuji...",
         add: "Přidat", login: "Login", signIn: "Přihlásit", signOut: "Odhlásit",
         hintUsernameEmail: "Jméno/Email", hintPassword: "Heslo",
         fillUsernamePassword: "Vyplňte jméno a heslo", fillEmailPassword: "Vyplňte email a heslo",
@@ -1886,7 +1894,9 @@ const T = {
     en: {
         serverStopped: "Server stopped", serverRunning: "Server running", serverUnavailable: "Server unavailable",
         start: "Start", stop: "Stop",
-        noLoginRequired: "No login required", notLoggedIn: "Not logged in",
+        noLoginRequired: "No login required", notLoggedIn: "Not logged in", loginRequired: "Login required",
+        netAll: "reachable by all devices", netLocal: "this device only",
+        pullRefresh: "Pull to refresh", pullRelease: "Release to refresh", refreshing: "Refreshing...",
         add: "Add", login: "Login", signIn: "Sign in", signOut: "Sign out",
         hintUsernameEmail: "Username/Email", hintPassword: "Password",
         fillUsernamePassword: "Enter username and password", fillEmailPassword: "Enter email and password",
@@ -1985,9 +1995,9 @@ function renderLanUI() {
 // signed in) it installs into the account; if the addon is already in the
 // account it shows "Nainštalované" instead.
 let installedKeys = [];
-async function refreshInstalled() {
+async function refreshInstalled(force) {
     try {
-        const r = await fetch(API + "/api/stremio/installed");
+        const r = await fetch(API + "/api/stremio/installed" + (force ? "?fresh=1" : ""));
         const j = await r.json();
         installedKeys = (j && j.keys) || [];
     } catch (e) { /* keep previous */ }
@@ -2093,7 +2103,7 @@ function closePanel(key) {
     }
 }
 
-async function loadStatus() {
+async function loadStatus(force) {
     try {
         const r = await fetch(API + "/api/status");
         const s = await r.json();
@@ -2121,13 +2131,17 @@ async function loadStatus() {
             document.getElementById("stremioAuthKey").classList.remove("hidden");
         }
         // Detect which addons are already in the account (shows "Nainštalované")
-        if (lanMode && stremioLoggedIn) { await refreshInstalled(); } else { installedKeys = []; }
+        if (lanMode && stremioLoggedIn) { await refreshInstalled(force); } else { installedKeys = []; }
         updateAddButtons();
 
         const running = s.serverRunning;
         document.getElementById("serverDot").className = "dot " + (running ? "dot-green" : "dot-red");
-        let runLabel = running ? t("serverRunning") : t("serverStopped");
-        if (running && lanMode && lanIps.length) runLabel = t("serverRunning") + " – " + lanIps[0];
+        let runLabel = t("serverStopped");
+        if (running) {
+            const inNet = lanMode && lanIps.length;
+            const ip = inNet ? lanIps[0] : "127.0.0.1";
+            runLabel = t("serverRunning") + " – " + ip + " (" + (inNet ? t("netAll") : t("netLocal")) + ")";
+        }
         document.getElementById("serverLabel").textContent = runLabel;
         document.getElementById("serverLabel").style.color = running ? "#34d399" : "#f87171";
         document.getElementById("serverToggle").textContent = running ? t("stop") : t("start");
@@ -2137,12 +2151,12 @@ async function loadStatus() {
         const stBadge = document.getElementById("badge-st");
         if (s.st.loggedIn) {
             stStatus.innerHTML = '✓ ' + s.st.user; stStatus.style.color = "#34d399";
-            stBadge.textContent = s.st.premium ? "✓" : "🔒"; stBadge.style.color = s.st.premium ? "#4a9c4f" : "#f87171";
+            stBadge.textContent = s.st.premium ? "✓" : "💲"; stBadge.style.color = s.st.premium ? "#4a9c4f" : "#fbbf24";
             document.getElementById("stEmail").value = s.st.user;
             document.getElementById("stLogoutBtn").classList.remove("hidden");
         } else {
             stStatus.textContent = t("notLoggedIn"); stStatus.style.color = "#6b7280";
-            stBadge.textContent = "🔒"; stBadge.style.color = "#f87171";
+            stBadge.textContent = "💲"; stBadge.style.color = "#fbbf24";
             document.getElementById("stLogoutBtn").classList.add("hidden");
         }
 
@@ -2151,12 +2165,12 @@ async function loadStatus() {
         const fsBadge = document.getElementById("badge-fs");
         if (s.fs.loggedIn) {
             fsStatus.innerHTML = '✓ ' + s.fs.user; fsStatus.style.color = "#34d399";
-            fsBadge.textContent = s.fs.unlimited ? "✓" : "🔒"; fsBadge.style.color = s.fs.unlimited ? "#4a9c4f" : "#f87171";
+            fsBadge.textContent = s.fs.unlimited ? "✓" : "💲"; fsBadge.style.color = s.fs.unlimited ? "#4a9c4f" : "#fbbf24";
             document.getElementById("fsUsername").value = s.fs.user;
             document.getElementById("fsLogoutBtn").classList.remove("hidden");
         } else {
             fsStatus.textContent = t("notLoggedIn"); fsStatus.style.color = "#6b7280";
-            fsBadge.textContent = "🔒"; fsBadge.style.color = "#f87171";
+            fsBadge.textContent = "💲"; fsBadge.style.color = "#fbbf24";
             document.getElementById("fsLogoutBtn").classList.add("hidden");
         }
 
@@ -2165,12 +2179,12 @@ async function loadStatus() {
         const wsBadge = document.getElementById("badge-ws");
         if (s.ws.loggedIn) {
             wsStatus.innerHTML = '✓ ' + s.ws.user; wsStatus.style.color = "#34d399";
-            wsBadge.textContent = s.ws.vip ? "✓" : "🔒"; wsBadge.style.color = s.ws.vip ? "#4a9c4f" : "#f87171";
+            wsBadge.textContent = s.ws.vip ? "✓" : "💲"; wsBadge.style.color = s.ws.vip ? "#4a9c4f" : "#fbbf24";
             document.getElementById("wsUsername").value = s.ws.user;
             document.getElementById("wsLogoutBtn").classList.remove("hidden");
         } else {
             wsStatus.textContent = t("notLoggedIn"); wsStatus.style.color = "#6b7280";
-            wsBadge.textContent = "🔒"; wsBadge.style.color = "#f87171";
+            wsBadge.textContent = "💲"; wsBadge.style.color = "#fbbf24";
             document.getElementById("wsLogoutBtn").classList.add("hidden");
         }
 
@@ -2183,8 +2197,8 @@ async function loadStatus() {
             document.getElementById("ptEmail").value = s.pt.user;
             document.getElementById("ptLogoutBtn").classList.remove("hidden");
         } else {
-            ptStatus.textContent = t("noLoginRequired"); ptStatus.style.color = "#34d399";
-            ptBadge.textContent = "✓"; ptBadge.style.color = "#4a9c4f";
+            ptStatus.textContent = t("loginRequired"); ptStatus.style.color = "#f87171";
+            ptBadge.textContent = "🔒"; ptBadge.style.color = "#f87171";
             document.getElementById("ptLogoutBtn").classList.add("hidden");
         }
 
@@ -2392,6 +2406,44 @@ applyStrings();
 loadStatus();
 // Background logins finish after page load - keep the status fresh
 setInterval(loadStatus, 10000);
+
+// ---- Pull-to-refresh (touch: pull down at the top to refresh statuses) ----
+(function () {
+    const ptr = document.getElementById("ptr");
+    const ptrText = document.getElementById("ptrText");
+    let startY = 0, pulling = false, refreshing = false;
+    const THRESHOLD = 70;
+
+    window.addEventListener("touchstart", (e) => {
+        if (refreshing) return;
+        if ((window.scrollY || document.documentElement.scrollTop) > 0) return;
+        startY = e.touches[0].clientY; pulling = true;
+    }, { passive: true });
+
+    window.addEventListener("touchmove", (e) => {
+        if (!pulling || refreshing) return;
+        const dy = e.touches[0].clientY - startY;
+        if (dy <= 0) { ptr.classList.remove("show"); return; }
+        const h = Math.min(dy, 90);
+        ptr.style.height = h + "px";
+        ptrText.textContent = dy >= THRESHOLD ? t("pullRelease") : t("pullRefresh");
+    }, { passive: true });
+
+    window.addEventListener("touchend", async (e) => {
+        if (!pulling || refreshing) { pulling = false; return; }
+        pulling = false;
+        const dy = (e.changedTouches[0].clientY - startY);
+        if (dy >= THRESHOLD) {
+            refreshing = true;
+            ptr.classList.add("show"); ptr.style.height = "";
+            ptrText.textContent = t("refreshing");
+            try { await loadStatus(true); } catch (err) {}
+            setTimeout(() => { ptr.classList.remove("show"); ptr.style.height = ""; refreshing = false; }, 400);
+        } else {
+            ptr.classList.remove("show"); ptr.style.height = "";
+        }
+    }, { passive: true });
+})();
 </script>
 </body>
 </html>`;
