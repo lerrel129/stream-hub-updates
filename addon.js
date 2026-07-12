@@ -15,7 +15,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 15;
+const APP_VERSION = 16;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1537,9 +1537,9 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
 .card-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .card-actions .btn-add, .card-actions .btn-login-card { padding: 8px 16px; border: none; border-radius: 12px; font-size: 12px; cursor: pointer; font-weight: bold; color: #fff; background: #4a9c4f; transition: background 0.15s; }
 .card-actions .btn-add:hover, .card-actions .btn-login-card:hover { background: #3d8b40; }
-.card-actions .btn-str { padding: 8px 16px; border: none; border-radius: 12px; font-size: 12px; cursor: pointer; font-weight: bold; color: #fff; background: #6366f1; transition: background 0.15s; }
-.card-actions .btn-str:hover { background: #4f46e5; }
-.card-actions .btn-str:disabled { opacity: 0.5; cursor: default; }
+.card-actions .btn-add.mode-account { background: #6366f1; }
+.card-actions .btn-add.mode-account:hover { background: #4f46e5; }
+.card-actions .btn-add:disabled { opacity: 0.5; cursor: default; }
 .card-badge { font-size: 14px; display: inline-block; line-height: 1; }
 .card-badge:empty { display: none; }
 
@@ -1619,7 +1619,6 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
                 <div class="card-status" id="status-hs" style="color:#34d399">Bez prihlásenia</div>
             </div>
             <div class="card-actions">
-                <button class="btn-str hidden" id="str-hs" onclick="event.stopPropagation();stremioInstallOne('hs')">Do účtu</button>
                 <button class="btn-add" onclick="event.stopPropagation();installOne('hs')">Pridať</button>
             </div>
         </div>
@@ -1634,7 +1633,6 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             </div>
             <div class="card-actions">
                 <button class="btn-login-card" onclick="event.stopPropagation();togglePanel('pt')">Prihlásiť</button>
-                <button class="btn-str hidden" id="str-pt" onclick="event.stopPropagation();stremioInstallOne('pt')">Do účtu</button>
                 <button class="btn-add" onclick="event.stopPropagation();installOne('pt')">Pridať</button>
             </div>
         </div>
@@ -1659,7 +1657,6 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             </div>
             <div class="card-actions">
                 <button class="btn-login-card" onclick="event.stopPropagation();togglePanel('st')">Prihlásiť</button>
-                <button class="btn-str hidden" id="str-st" onclick="event.stopPropagation();stremioInstallOne('st')">Do účtu</button>
                 <button class="btn-add" onclick="event.stopPropagation();installOne('st')">Pridať</button>
             </div>
         </div>
@@ -1684,7 +1681,6 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             </div>
             <div class="card-actions">
                 <button class="btn-login-card" onclick="event.stopPropagation();togglePanel('fs')">Prihlásiť</button>
-                <button class="btn-str hidden" id="str-fs" onclick="event.stopPropagation();stremioInstallOne('fs')">Do účtu</button>
                 <button class="btn-add" onclick="event.stopPropagation();installOne('fs')">Pridať</button>
             </div>
         </div>
@@ -1709,7 +1705,6 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
             </div>
             <div class="card-actions">
                 <button class="btn-login-card" onclick="event.stopPropagation();togglePanel('ws')">Prihlásiť</button>
-                <button class="btn-str hidden" id="str-ws" onclick="event.stopPropagation();stremioInstallOne('ws')">Do účtu</button>
                 <button class="btn-add" onclick="event.stopPropagation();installOne('ws')">Pridať</button>
             </div>
         </div>
@@ -1764,7 +1759,6 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
 
     <div class="login-panel open" id="stremioBox" style="animation:none;">
         <div class="panel-title" id="stremioTitle">Inštalovať do Stremio účtu</div>
-        <div id="stremioHelp" style="font-size:11px; color:#9ca3af; margin-bottom:10px; line-height:1.5;"></div>
         <input type="text" id="stremioEmail" placeholder="Stremio email">
         <input type="password" id="stremioPassword" placeholder="Heslo (alebo authKey nižšie)">
         <input type="text" id="stremioAuthKey" placeholder="authKey (voliteľné)">
@@ -1827,7 +1821,7 @@ const T = {
         strHelp: "Prihlás sa do svojho Stremio účtu – doplnky sa zapíšu priamo do účtu a nasynchronizujú na telefón aj TV (obíde to blokovanie http). Zapni najprv „Prístup zo siete“.",
         strAddOne: "Do účtu", strInstalling: "Pridávam...",
         strInstalled: "Hotovo – pridané do účtu. Otvor Stremio na TV/telefóne.",
-        strUseCards: "Pri každom doplnku stlač „Do účtu“ pre pridanie do Stremia.",
+        strUseCards: "Tlačidlo „Pridať“ teraz pridáva doplnky priamo do Stremio účtu.",
         strNeedLan: "Najprv zapni „Prístup zo siete (LAN)“.",
         strLoggedIn: "Prihlásený", strFillLogin: "Zadaj email a heslo alebo authKey",
     },
@@ -1854,7 +1848,7 @@ const T = {
         strHelp: "Přihlas se do svého Stremio účtu – doplňky se zapíšou přímo do účtu a nasynchronizují na telefon i TV (obejde to blokování http). Zapni nejdřív „Přístup ze sítě“.",
         strAddOne: "Do účtu", strInstalling: "Přidávám...",
         strInstalled: "Hotovo – přidáno do účtu. Otevři Stremio na TV/telefonu.",
-        strUseCards: "U každého doplňku stiskni „Do účtu“ pro přidání do Stremia.",
+        strUseCards: "Tlačítko „Přidat“ teď přidává doplňky přímo do Stremio účtu.",
         strNeedLan: "Nejdřív zapni „Přístup ze sítě (LAN)“.",
         strLoggedIn: "Přihlášen", strFillLogin: "Zadej email a heslo nebo authKey",
     },
@@ -1881,7 +1875,7 @@ const T = {
         strHelp: "Sign in to your Stremio account - the addons are written straight into the account and sync to your phone and TV (this bypasses the http block). Turn on Network access first.",
         strAddOne: "To account", strInstalling: "Adding...",
         strInstalled: "Done - added to your account. Open Stremio on your TV/phone.",
-        strUseCards: "Press „To account“ on each addon to add it to Stremio.",
+        strUseCards: "The Add button now adds addons straight into your Stremio account.",
         strNeedLan: "Turn on Network access (LAN) first.",
         strLoggedIn: "Signed in", strFillLogin: "Enter email and password or authKey",
     }
@@ -1927,7 +1921,7 @@ function applyStrings() {
     document.querySelector("#panel-pt .panel-title").textContent = t("panelPt");
 
     // Add buttons
-    document.querySelectorAll(".btn-add").forEach(b => b.textContent = t("add"));
+    updateAddButtons();
 
     // Login buttons on cards
     document.querySelectorAll(".btn-login-card").forEach(b => b.textContent = t("signIn"));
@@ -1942,7 +1936,6 @@ function applyStrings() {
     // LAN + Stremio account panel
     document.getElementById("lanTitle").textContent = t("lanTitle");
     document.getElementById("stremioTitle").textContent = t("strTitle");
-    document.getElementById("stremioHelp").textContent = t("strHelp");
     renderLanUI();
 }
 
@@ -1955,6 +1948,16 @@ function renderLanUI() {
     document.getElementById("lanStatus").textContent = lanMode ? t("lanOn") : t("lanOff");
     document.getElementById("lanStatus").style.color = lanMode ? "#34d399" : "#9ca3af";
     document.getElementById("lanBtn").textContent = lanMode ? t("lanDisable") : t("lanEnable");
+}
+
+// In account mode (LAN + Stremio signed in) the Add button installs into the
+// account and is styled/labelled accordingly; otherwise it's the local Add.
+function updateAddButtons() {
+    const account = lanMode && stremioLoggedIn;
+    document.querySelectorAll(".btn-add").forEach(b => {
+        b.textContent = account ? t("strAddOne") : t("add");
+        b.classList.toggle("mode-account", account);
+    });
 }
 
 async function lanToggle() {
@@ -1999,37 +2002,26 @@ async function stremioLogoutAction() {
     await loadStatus();
 }
 
-// Install a single addon straight into the Stremio account (per-card button).
-async function stremioInstallOne(key) {
-    const msg = document.getElementById("stremioMsg");
-    if (!stremioLoggedIn) { msg.style.color = "#f87171"; msg.textContent = t("strFillLogin"); return; }
-    if (!lanMode) { msg.style.color = "#fbbf24"; msg.textContent = t("strNeedLan"); return; }
-    const btn = document.getElementById("str-" + key);
+// Install a single addon straight into the Stremio account. Runs from the
+// "Pridať" (Add) button when LAN mode is on AND the Stremio account is signed
+// in - otherwise the Add button falls back to the local stremio:// link.
+async function accountInstall(key) {
+    const btn = document.querySelector("#card-" + key + " .btn-add");
     const original = btn ? btn.textContent : "";
     if (btn) { btn.disabled = true; btn.textContent = "..."; }
-    msg.dataset.keep = "1"; // don't let the 10s status refresh overwrite the result
-    msg.style.color = "#9ca3af";
-    msg.textContent = t("strInstalling");
     try {
         const r = await fetch(API + "/api/stremio/install", { method: "POST", body: JSON.stringify({ keys: [key] }) });
         const j = await r.json();
         if (j.ok) {
             if (btn) btn.textContent = "✓";
-            msg.style.color = "#34d399";
-            msg.textContent = t("strInstalled") + " (http://" + j.host + ":${ADDON_PORT})";
-            setTimeout(() => { if (btn) btn.textContent = original; }, 2000);
-        } else {
-            if (btn) btn.textContent = original;
-            msg.style.color = "#f87171";
-            msg.textContent = t("error") + (j.error ? ": " + j.error : "");
+            setTimeout(() => { if (btn) { btn.textContent = original; btn.disabled = false; } }, 1800);
+            return;
         }
+        alert(t("error") + (j.error ? ": " + j.error : ""));
     } catch (e) {
-        if (btn) btn.textContent = original;
-        msg.style.color = "#f87171";
-        msg.textContent = t("error") + ": " + e.message;
+        alert(t("error") + ": " + e.message);
     }
-    if (btn) btn.disabled = false;
-    setTimeout(() => { delete msg.dataset.keep; }, 6000);
+    if (btn) { btn.textContent = original; btn.disabled = false; }
 }
 
 function togglePanel(key) {
@@ -2071,19 +2063,15 @@ async function loadStatus() {
             document.getElementById("stremioAuthKey").classList.add("hidden");
             // Per-addon install works only with LAN on; guide the user otherwise
             if (!lanMode) { strMsg.style.color = "#fbbf24"; strMsg.textContent = t("strNeedLan"); }
-            else if (!strMsg.dataset.keep) { strMsg.style.color = "#9ca3af"; strMsg.textContent = t("strUseCards"); }
+            else { strMsg.style.color = "#9ca3af"; strMsg.textContent = t("strUseCards"); }
         } else {
             document.getElementById("stremioLoginBtn").classList.remove("hidden");
             document.getElementById("stremioLogoutBtn").classList.add("hidden");
             document.getElementById("stremioPassword").classList.remove("hidden");
             document.getElementById("stremioAuthKey").classList.remove("hidden");
         }
-        // Per-card "Do účtu" buttons - only when LAN is on AND Stremio is logged in
-        const showStr = lanMode && stremioLoggedIn;
-        ["hs", "pt", "st", "fs", "ws"].forEach(k => {
-            const b = document.getElementById("str-" + k);
-            if (b) { b.classList.toggle("hidden", !showStr); b.textContent = t("strAddOne"); }
-        });
+        // "Pridať" buttons switch to account mode when LAN + Stremio are active
+        updateAddButtons();
 
         const running = s.serverRunning;
         document.getElementById("serverDot").className = "dot " + (running ? "dot-green" : "dot-red");
@@ -2234,6 +2222,9 @@ async function toggleServer() {
 }
 
 function installOne(key) {
+    // LAN + Stremio account active -> add straight into the account.
+    if (lanMode && stremioLoggedIn) return accountInstall(key);
+    // Otherwise the normal local install: copy URL + open the stremio:// link.
     const url = addonUrls[key];
     if (!url) return;
     navigator.clipboard.writeText(url).then(() => {
