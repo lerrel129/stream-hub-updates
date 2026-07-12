@@ -17,7 +17,7 @@ const CONFIG_PATH = path.join(process.env.STREAMHUB_CONFIG_DIR || __dirname, "co
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 10;
+const APP_VERSION = 11;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1704,8 +1704,9 @@ const T = {
         appUpdTitle: "Nová verzia aplikácie", appUpdBtn: "Stiahnuť APK",
         lanTitle: "Prístup zo siete (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnúť", lanDisable: "Vypnúť",
-        lanHint: "V Stremiu na iPhone/TV/inom zariadení pridajte addon cez:",
+        lanHintAdd: "Tlačidlo „Pridať“ teraz pridáva adresu doplnku dostupnú v celej sieti (iPhone, TV...).",
         lanWarn: "Pozor: server bude dostupný pre všetky zariadenia v domácej sieti.",
+        serverRunningAt: "Server beží na",
     },
     cz: {
         serverStopped: "Server zastaven", serverRunning: "Server běží", serverUnavailable: "Server nedostupný",
@@ -1725,8 +1726,9 @@ const T = {
         appUpdTitle: "Nová verze aplikace", appUpdBtn: "Stáhnout APK",
         lanTitle: "Přístup ze sítě (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnout", lanDisable: "Vypnout",
-        lanHint: "Ve Stremiu na iPhonu/TV/jiném zařízení přidejte addon přes:",
+        lanHintAdd: "Tlačítko „Přidat“ nyní přidává adresu doplňku dostupnou v celé síti (iPhone, TV...).",
         lanWarn: "Pozor: server bude dostupný pro všechna zařízení v domácí síti.",
+        serverRunningAt: "Server běží na",
     },
     en: {
         serverStopped: "Server stopped", serverRunning: "Server running", serverUnavailable: "Server unavailable",
@@ -1746,8 +1748,9 @@ const T = {
         appUpdTitle: "New app version", appUpdBtn: "Download APK",
         lanTitle: "Network access (LAN)", lanOn: "Enabled", lanOff: "Disabled",
         lanEnable: "Enable", lanDisable: "Disable",
-        lanHint: "In Stremio on iPhone/TV/another device add the addon via:",
+        lanHintAdd: "The Add button now hands out the network-wide addon address (iPhone, TV...).",
         lanWarn: "Warning: the server will be reachable by every device on your home network.",
+        serverRunningAt: "Server running on",
     }
 };
 let lang = localStorage.getItem("lang") || "sk";
@@ -1818,9 +1821,7 @@ function renderLanUI() {
     document.getElementById("lanBtn").textContent = lanMode ? t("lanDisable") : t("lanEnable");
     const urls = document.getElementById("lanUrls");
     if (lanMode && lanIps.length) {
-        urls.innerHTML = t("lanHint") + "<br>" +
-            lanIps.map(ip => "http://" + ip + ":${ADDON_PORT}/st/manifest.json").join("<br>") +
-            "<br>" + t("lanWarn");
+        urls.innerHTML = t("lanHintAdd") + "<br>" + t("lanWarn");
     } else {
         urls.textContent = "";
     }
@@ -1867,7 +1868,9 @@ async function loadStatus() {
 
         const running = s.serverRunning;
         document.getElementById("serverDot").className = "dot " + (running ? "dot-green" : "dot-red");
-        document.getElementById("serverLabel").textContent = running ? t("serverRunning") : t("serverStopped");
+        let runLabel = t("serverRunning");
+        if (running && lanMode && lanIps.length) runLabel = t("serverRunningAt") + " " + lanIps[0];
+        document.getElementById("serverLabel").textContent = running ? runLabel : t("serverStopped");
         document.getElementById("serverLabel").style.color = running ? "#34d399" : "#f87171";
         document.getElementById("serverToggle").textContent = running ? t("stop") : t("start");
 
@@ -2012,8 +2015,11 @@ async function toggleServer() {
 }
 
 function installOne(key) {
-    const url = addonUrls[key];
+    let url = addonUrls[key];
     if (!url) return;
+    // In LAN mode the Add button hands out the network-wide address,
+    // so the addon works in Stremio on any device in the LAN.
+    if (lanMode && lanIps.length) url = url.replace("127.0.0.1", lanIps[0]);
     navigator.clipboard.writeText(url).then(() => {
         window.open("stremio://" + url.replace(/^https?:\\/\\//, ""), "_blank");
     });

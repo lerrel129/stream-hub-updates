@@ -1,7 +1,7 @@
 {
-  "version": 10,
+  "version": 11,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.1: LAN mode - use the addons in Stremio on iPhone, LG TV or any device on your home network",
-  "apkVersion": 21,
+  "notes": "v2.1: LAN mode - the Add button hands out the network-wide addon address; server bar shows the server IP",
+  "apkVersion": 22,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
