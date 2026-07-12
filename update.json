@@ -1,7 +1,7 @@
 {
-  "version": 19,
+  "version": 20,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.6: 'Hostname instead of IP' toggle - install addons into your Stremio account using the device name (.local) so they survive IP changes",
-  "apkVersion": 30,
+  "notes": "v2.7: fix hostname install - never uses 'localhost.local'; falls back to IP and marks hostname unavailable when the device has no usable .local name (e.g. Android)",
+  "apkVersion": 31,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }

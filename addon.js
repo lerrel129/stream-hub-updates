@@ -15,7 +15,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 19;
+const APP_VERSION = 20;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1016,18 +1016,32 @@ function getLanIps() {
     return ips;
 }
 
-// mDNS name of this device, e.g. "lenovo_loq.local". IMPORTANT: use the exact
-// OS hostname (only strip a trailing .local) - the name advertised over mDNS
-// keeps underscores etc., so sanitising them breaks resolution.
-function getLanHostname() {
-    return os.hostname().replace(/\.local$/i, "") + ".local";
+function rawHostname() {
+    try { return (os.hostname() || "").trim(); } catch (e) { return ""; }
 }
 
-// Host used when writing addon URLs into the Stremio account:
-// hostname (survives IP changes) or the LAN IP, per config.useHostname.
+// Is the OS hostname usable as an mDNS name? On Android nodejs-mobile reports
+// "localhost", which is useless (and Android doesn't advertise a .local name
+// anyway), so hostname mode is only available where the name is real.
+function hostnameUsable() {
+    const h = rawHostname().toLowerCase().replace(/\.local$/, "");
+    return !!h && h !== "localhost" && /[a-z0-9]/.test(h);
+}
+
+// mDNS name of this device, e.g. "lenovo_loq.local", or "" if not usable.
+// IMPORTANT: use the exact OS hostname (only strip a trailing .local) - the
+// mDNS-advertised name keeps underscores etc., so sanitising them breaks it.
+function getLanHostname() {
+    return hostnameUsable() ? rawHostname().replace(/\.local$/i, "") + ".local" : "";
+}
+
+// Host used when writing addon URLs into the Stremio account: hostname
+// (survives IP changes) or the LAN IP. Falls back to IP when hostname mode is
+// on but no usable hostname exists - never produces "localhost.local".
 function accountHost() {
     if (!config.lanMode) return "127.0.0.1";
-    if (config.useHostname) return getLanHostname();
+    const hn = getLanHostname();
+    if (config.useHostname && hn) return hn;
     const ips = getLanIps();
     return ips.length ? ips[0] : "127.0.0.1";
 }
@@ -1220,6 +1234,7 @@ function startProxyServer() {
                 lanMode: !!config.lanMode,
                 lanIps: getLanIps(),
                 lanHostname: getLanHostname(),
+                hostnameAvailable: hostnameUsable(),
                 useHostname: !!config.useHostname,
                 stremio: { loggedIn: !!config.stremioAuthKey, user: config.stremioUser || "" },
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
@@ -1884,7 +1899,7 @@ const T = {
         noLoginRequired: "Bez prihlásenia", notLoggedIn: "Neprihlásený", loginRequired: "Prihlásenie nutné",
         netAll: "dostupné pre všetky zariadenia", netLocal: "len toto zariadenie",
         pullRefresh: "Potiahnite pre obnovenie", pullRelease: "Pustite pre obnovenie", refreshing: "Obnovujem...",
-        hostTitle: "Názov namiesto IP",
+        hostTitle: "Názov namiesto IP", hostNA: "Nedostupné na tomto zariadení",
         add: "Pridať", login: "Login", signIn: "Prihlásiť", signOut: "Odhlásiť",
         hintUsernameEmail: "Meno/Email", hintPassword: "Heslo",
         fillUsernamePassword: "Vyplňte meno a heslo", fillEmailPassword: "Vyplňte email a heslo",
@@ -1914,7 +1929,7 @@ const T = {
         noLoginRequired: "Bez přihlášení", notLoggedIn: "Nepřihlášen", loginRequired: "Přihlášení nutné",
         netAll: "dostupné pro všechna zařízení", netLocal: "jen toto zařízení",
         pullRefresh: "Táhněte pro obnovení", pullRelease: "Pusťte pro obnovení", refreshing: "Obnovuji...",
-        hostTitle: "Název místo IP",
+        hostTitle: "Název místo IP", hostNA: "Nedostupné na tomto zařízení",
         add: "Přidat", login: "Login", signIn: "Přihlásit", signOut: "Odhlásit",
         hintUsernameEmail: "Jméno/Email", hintPassword: "Heslo",
         fillUsernamePassword: "Vyplňte jméno a heslo", fillEmailPassword: "Vyplňte email a heslo",
@@ -1944,7 +1959,7 @@ const T = {
         noLoginRequired: "No login required", notLoggedIn: "Not logged in", loginRequired: "Login required",
         netAll: "reachable by all devices", netLocal: "this device only",
         pullRefresh: "Pull to refresh", pullRelease: "Release to refresh", refreshing: "Refreshing...",
-        hostTitle: "Hostname instead of IP",
+        hostTitle: "Hostname instead of IP", hostNA: "Not available on this device",
         add: "Add", login: "Login", signIn: "Sign in", signOut: "Sign out",
         hintUsernameEmail: "Username/Email", hintPassword: "Password",
         fillUsernamePassword: "Enter username and password", fillEmailPassword: "Enter email and password",
@@ -2034,6 +2049,7 @@ let lanMode = false;
 let lanIps = [];
 let lanHostname = "";
 let useHostname = false;
+let hostnameAvailable = false;
 let stremioLoggedIn = false;
 
 function renderLanUI() {
@@ -2041,12 +2057,21 @@ function renderLanUI() {
     document.getElementById("lanStatus").style.color = lanMode ? "#34d399" : "#9ca3af";
     document.getElementById("lanBtn").textContent = lanMode ? t("lanDisable") : t("lanEnable");
 
-    // Hostname toggle - only meaningful while LAN mode is on
-    document.getElementById("hostBar").style.opacity = lanMode ? "1" : "0.45";
-    document.getElementById("hostBtn").disabled = !lanMode;
-    document.getElementById("hostStatus").textContent = useHostname ? (t("lanOn") + (lanHostname ? " (" + lanHostname + ")" : "")) : t("lanOff");
-    document.getElementById("hostStatus").style.color = useHostname ? "#34d399" : "#9ca3af";
-    document.getElementById("hostBtn").textContent = useHostname ? t("lanDisable") : t("lanEnable");
+    // Hostname toggle - needs LAN on AND a usable .local name (not on Android)
+    const hostOk = lanMode && hostnameAvailable;
+    const hostStatus = document.getElementById("hostStatus");
+    document.getElementById("hostBar").style.opacity = hostOk ? "1" : "0.45";
+    document.getElementById("hostBtn").disabled = !hostOk;
+    if (!hostnameAvailable) {
+        hostStatus.textContent = t("hostNA");
+        hostStatus.style.color = "#fbbf24";
+        document.getElementById("hostBtn").textContent = t("lanEnable");
+    } else {
+        const on = useHostname;
+        hostStatus.textContent = on ? (t("lanOn") + (lanHostname ? " (" + lanHostname + ")" : "")) : t("lanOff");
+        hostStatus.style.color = on ? "#34d399" : "#9ca3af";
+        document.getElementById("hostBtn").textContent = on ? t("lanDisable") : t("lanEnable");
+    }
 }
 
 // The Add button keeps its label/colour. In account mode (LAN + Stremio
@@ -2180,6 +2205,7 @@ async function loadStatus(force) {
         lanIps = s.lanIps || [];
         lanHostname = s.lanHostname || "";
         useHostname = !!s.useHostname;
+        hostnameAvailable = !!s.hostnameAvailable;
         renderLanUI();
         stremioLoggedIn = !!(s.stremio && s.stremio.loggedIn);
         const strMsg = document.getElementById("stremioMsg");
