@@ -1,7 +1,7 @@
 {
-  "version": 20,
+  "version": 21,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.7: fix hostname install - never uses 'localhost.local'; falls back to IP and marks hostname unavailable when the device has no usable .local name (e.g. Android)",
-  "apkVersion": 31,
+  "notes": "v2.8: stable name via mDNS - the app advertises streamhub.local so addons work by name (survives IP changes), including on Android (MulticastLock)",
+  "apkVersion": 32,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }

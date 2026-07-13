@@ -15,7 +15,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 20;
+const APP_VERSION = 21;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1021,26 +1021,72 @@ function rawHostname() {
 }
 
 // Is the OS hostname usable as an mDNS name? On Android nodejs-mobile reports
-// "localhost", which is useless (and Android doesn't advertise a .local name
-// anyway), so hostname mode is only available where the name is real.
+// "localhost", which is useless, so the OS name is only used where it's real
+// (e.g. Windows advertises it automatically). On Android we instead advertise
+// our own fixed name via the mDNS responder below.
 function hostnameUsable() {
     const h = rawHostname().toLowerCase().replace(/\.local$/, "");
     return !!h && h !== "localhost" && /[a-z0-9]/.test(h);
 }
 
-// mDNS name of this device, e.g. "lenovo_loq.local", or "" if not usable.
-// IMPORTANT: use the exact OS hostname (only strip a trailing .local) - the
-// mDNS-advertised name keeps underscores etc., so sanitising them breaks it.
-function getLanHostname() {
-    return hostnameUsable() ? rawHostname().replace(/\.local$/i, "") + ".local" : "";
+// ---- mDNS responder ----
+// We actively advertise a FIXED name (streamhub.local) over mDNS pointing at
+// the current LAN IP. This makes the server reachable by a stable name that
+// survives IP changes, and works even on Android (which does NOT advertise its
+// own hostname). Clients that resolve .local - iOS/macOS, Windows, Android 12+
+// - can then reach the addons. Uses multicast-dns if bundled; degrades to no
+// mDNS (falls back to IP) when the module or multicast isn't available.
+const MDNS_NAME = "streamhub.local";
+let mdns = null;
+let mdnsActive = false;
+
+function startMdns() {
+    try {
+        const makeMdns = require("multicast-dns");
+        mdns = makeMdns();
+        mdns.on("warning", () => {});
+        mdns.on("error", (e) => console.log("[MDNS] error:", e && e.message));
+        mdns.on("query", (query) => {
+            try {
+                const ip = getLanIps()[0];
+                if (!ip) return;
+                for (const q of query.questions || []) {
+                    if ((q.name || "").toLowerCase() === MDNS_NAME &&
+                        (q.type === "A" || q.type === "ANY")) {
+                        mdns.respond({ answers: [{ name: MDNS_NAME, type: "A", ttl: 120, data: ip }] });
+                    }
+                }
+            } catch (e) {}
+        });
+        mdnsActive = true;
+        console.log(`[MDNS] Advertising ${MDNS_NAME}`);
+        // Announce a couple of times so caches warm up
+        const announce = () => { const ip = getLanIps()[0]; if (ip && mdns) try { mdns.respond({ answers: [{ name: MDNS_NAME, type: "A", ttl: 120, data: ip }] }); } catch (e) {} };
+        setTimeout(announce, 1000);
+        setTimeout(announce, 3000);
+    } catch (e) {
+        mdnsActive = false;
+        console.log("[MDNS] not available:", e && e.message);
+    }
 }
+
+function getMdnsName() { return mdnsActive ? MDNS_NAME : ""; }
+
+// The .local name used for account URLs: our advertised mDNS name (works
+// everywhere, incl. Android) or the OS hostname where usable, else "".
+function preferredHostname() {
+    return getMdnsName() || (hostnameUsable() ? rawHostname().replace(/\.local$/i, "") + ".local" : "");
+}
+
+// Backwards-compatible alias used by the status endpoint / UI.
+function getLanHostname() { return preferredHostname(); }
 
 // Host used when writing addon URLs into the Stremio account: hostname
 // (survives IP changes) or the LAN IP. Falls back to IP when hostname mode is
-// on but no usable hostname exists - never produces "localhost.local".
+// on but no usable name exists - never produces "localhost.local".
 function accountHost() {
     if (!config.lanMode) return "127.0.0.1";
-    const hn = getLanHostname();
+    const hn = preferredHostname();
     if (config.useHostname && hn) return hn;
     const ips = getLanIps();
     return ips.length ? ips[0] : "127.0.0.1";
@@ -1233,8 +1279,8 @@ function startProxyServer() {
                 serverRunning,
                 lanMode: !!config.lanMode,
                 lanIps: getLanIps(),
-                lanHostname: getLanHostname(),
-                hostnameAvailable: hostnameUsable(),
+                lanHostname: preferredHostname(),
+                hostnameAvailable: !!preferredHostname(),
                 useHostname: !!config.useHostname,
                 stremio: { loggedIn: !!config.stremioAuthKey, user: config.stremioUser || "" },
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
@@ -2968,6 +3014,7 @@ async function start() {
     // logins and catalog preload run in the background.
     startProxyServer();
     startAddonServer();
+    startMdns(); // advertise streamhub.local over mDNS (best effort)
 
     (async () => {
         await loginAllFromConfig();
