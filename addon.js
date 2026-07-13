@@ -1853,7 +1853,7 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
     </div>
 
     <div class="login-panel open" id="stremioBox" style="animation:none;">
-        <div class="panel-title" id="stremioTitle">Inštalovať do Stremio účtu</div>
+        <div class="panel-title" id="stremioTitle">Prihlásiť do Stremio</div>
         <input type="text" id="stremioEmail" placeholder="Stremio email">
         <input type="password" id="stremioPassword" placeholder="Heslo (alebo authKey nižšie)">
         <input type="text" id="stremioAuthKey" placeholder="authKey (voliteľné)">
@@ -1915,7 +1915,7 @@ const T = {
         lanTitle: "Prístup zo siete (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnúť", lanDisable: "Vypnúť",
         lanWarn: "Server bude dostupný pre všetky zariadenia v sieti.",
-        strTitle: "Inštalovať do Stremio účtu",
+        strTitle: "Prihlásiť do Stremio",
         strHelp: "Prihlás sa do svojho Stremio účtu – doplnky sa zapíšu priamo do účtu a nasynchronizujú na telefón aj TV (obíde to blokovanie http). Zapni najprv „Prístup zo siete“.",
         installed: "Nainštalované", strAddOne: "Do účtu", strInstalling: "Pridávam...",
         strInstalled: "Hotovo – pridané do účtu. Otvor Stremio na TV/telefóne.",
@@ -1945,7 +1945,7 @@ const T = {
         lanTitle: "Přístup ze sítě (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnout", lanDisable: "Vypnout",
         lanWarn: "Server bude dostupný pro všechna zařízení v síti.",
-        strTitle: "Instalovat do Stremio účtu",
+        strTitle: "Přihlásit do Stremio",
         strHelp: "Přihlas se do svého Stremio účtu – doplňky se zapíšou přímo do účtu a nasynchronizují na telefon i TV (obejde to blokování http). Zapni nejdřív „Přístup ze sítě“.",
         installed: "Nainstalováno", strAddOne: "Do účtu", strInstalling: "Přidávám...",
         strInstalled: "Hotovo – přidáno do účtu. Otevři Stremio na TV/telefonu.",
@@ -1975,7 +1975,7 @@ const T = {
         lanTitle: "Network access (LAN)", lanOn: "Enabled", lanOff: "Disabled",
         lanEnable: "Enable", lanDisable: "Disable",
         lanWarn: "The server will be reachable by every device on the network.",
-        strTitle: "Install into Stremio account",
+        strTitle: "Sign in to Stremio",
         strHelp: "Sign in to your Stremio account - the addons are written straight into the account and sync to your phone and TV (this bypasses the http block). Turn on Network access first.",
         installed: "Installed", strAddOne: "To account", strInstalling: "Adding...",
         strInstalled: "Done - added to your account. Open Stremio on your TV/phone.",
