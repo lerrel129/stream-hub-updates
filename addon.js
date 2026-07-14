@@ -1253,8 +1253,9 @@ async function startTunnel() {
         });
         tunnelUrl = "https://" + r.hostname;
         console.log("[TUNNEL] URL:", tunnelUrl);
-        // let it connect + DNS propagate, then push the new URL to the account
-        setTimeout(() => autoReinstallTunnel().catch(() => {}), 16000);
+        // push the new URL to the account, but only once it is actually live
+        // (the quick-tunnel URL changes every restart + needs DNS propagation)
+        setTimeout(() => autoReinstallTunnel().catch(() => {}), 3000);
     } catch (e) {
         console.error("[TUNNEL] start error:", e.message);
         tunnelUrl = "";
@@ -1269,10 +1270,29 @@ function stopTunnel() {
     tunnelUrl = "";
 }
 
+// Wait until the current tunnel URL actually serves our manifest (tunnel
+// connected + DNS propagated). Returns false on timeout.
+async function waitTunnelReady(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    const startedUrl = tunnelUrl;
+    while (Date.now() < deadline) {
+        if (!tunnelUrl || tunnelUrl !== startedUrl) return false; // changed/stopped
+        try {
+            const r = await axios.get(tunnelUrl + "/hs/manifest.json", { timeout: 8000, validateStatus: () => true });
+            if (r.status === 200) return true;
+        } catch (e) {}
+        await new Promise(res => setTimeout(res, 4000));
+    }
+    return false;
+}
+
 // The quick-tunnel URL changes on every (re)start; re-push whatever addons are
-// already in the account so it always points at the current https URL.
+// already in the account so it always points at the current https URL - but
+// only after the URL is confirmed live, so the account never holds a dead URL.
 async function autoReinstallTunnel() {
-    if (!config.stremioAuthKey || !tunnelActive()) return;
+    if (!config.stremioAuthKey || !config.tunnelEnabled) return;
+    const ready = await waitTunnelReady(70000);
+    if (!ready || !tunnelActive()) { console.log("[TUNNEL] URL not ready - skipping account update"); return; }
     try {
         const addons = await stremioGetAddons(config.stremioAuthKey);
         const have = ["st", "fs", "hs", "ws", "pt"].filter(k => addons.some(a => new RegExp(`/${k}/manifest\\.json$`).test((a && a.transportUrl) || "")));
@@ -2248,6 +2268,7 @@ let stremioLoggedIn = false;
 let tunnelAvailable = false;
 let tunnelEnabled = false;
 let tunnelUrl = "";
+let ptLoggedIn = false; // Prehraj.to needs a login before its addon can be added
 
 // Account install works when signed in AND the server is reachable remotely -
 // either via LAN or via the HTTPS tunnel.
@@ -2323,6 +2344,15 @@ function updateAddButtons() {
     ["hs", "pt", "st", "fs", "ws"].forEach(k => {
         const b = document.querySelector("#card-" + k + " .btn-add");
         if (!b) return;
+        // Prehraj.to requires a login - don't allow adding until signed in.
+        if (k === "pt" && !ptLoggedIn) {
+            b.textContent = t("add");
+            b.classList.remove("btn-installed");
+            b.disabled = true;
+            b.title = t("loginRequired");
+            return;
+        }
+        b.title = "";
         if (account && installedKeys.indexOf(k) !== -1) {
             b.textContent = t("installed");
             b.classList.add("btn-installed");
@@ -2442,6 +2472,7 @@ async function loadStatus(force) {
         tunnelAvailable = !!s.tunnelAvailable;
         tunnelEnabled = !!s.tunnelEnabled;
         tunnelUrl = s.tunnelUrl || "";
+        ptLoggedIn = !!(s.pt && s.pt.loggedIn);
         renderLanUI();
         renderTunnelUI();
         stremioLoggedIn = !!(s.stremio && s.stremio.loggedIn);
@@ -2521,6 +2552,7 @@ async function loadStatus(force) {
         }
 
         // PT
+        ptLoggedIn = !!s.pt.loggedIn;
         const ptStatus = document.getElementById("status-pt");
         const ptBadge = document.getElementById("badge-pt");
         if (s.pt.loggedIn) {
