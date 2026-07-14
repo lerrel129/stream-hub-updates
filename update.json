@@ -1,7 +1,7 @@
 {
-  "version": 21,
+  "version": 22,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.8: stable name via mDNS - the app advertises streamhub.local so addons work by name (survives IP changes), including on Android (MulticastLock)",
-  "apkVersion": 32,
+  "notes": "v2.9: free HTTPS tunnel (Cloudflare) - works on LG/Samsung TV & Stremio Web; addons install into your account over https and sync to the TV, nothing installed on the TV",
+  "apkVersion": 33,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }

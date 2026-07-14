@@ -4,6 +4,8 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const dns = require("dns");
+const { spawn } = require("child_process");
 
 const BASE_URL = "https://www.sledujteto.cz";
 const API_URL = `${BASE_URL}/api/web`;
@@ -15,7 +17,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 21;
+const APP_VERSION = 22;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1092,11 +1094,24 @@ function accountHost() {
     return ips.length ? ips[0] : "127.0.0.1";
 }
 
-// Absolute URLs in responses point at 127.0.0.1; when a LAN client requests
-// them, rewrite to the host it used so the links work on that device too.
+// Absolute URLs in responses point at 127.0.0.1; rewrite them to the host the
+// client actually used so the links work on that device too.
+//  - LAN request: replace the host part only (keep http + ports).
+//  - Tunnel request (https, single origin, no local ports): rewrite BOTH the
+//    addon (7515) and proxy (7516) origins to the tunnel https origin, so
+//    stream/proxy URLs come back through the same tunnel.
 function rewriteLocalUrls(str, req) {
-    const host = ((req.headers && req.headers.host) || "").split(":")[0];
+    const hostHeader = (req.headers && req.headers.host) || "";
+    const host = hostHeader.split(":")[0];
     if (!host || host === "127.0.0.1" || host === "localhost") return str;
+    const proto = ((req.headers && req.headers["x-forwarded-proto"]) || "").toLowerCase();
+    const isTunnel = proto === "https" || /\.trycloudflare\.com$/i.test(host);
+    if (isTunnel) {
+        const origin = "https://" + hostHeader;
+        return str
+            .split(`http://127.0.0.1:${PROXY_PORT}`).join(origin)
+            .split(`http://127.0.0.1:${ADDON_PORT}`).join(origin);
+    }
     return str.split("127.0.0.1").join(host);
 }
 
@@ -1139,34 +1154,35 @@ async function stremioGetAddons(authKey) {
     return (coll && coll.addons) || [];
 }
 
-// Which of our addons are already in the account for the given host.
+// Which of our addons are already in the account (matched host-agnostically by
+// the /{key}/manifest.json path, so it survives base/URL changes).
 // Cached briefly so the /configure status poll doesn't hammer the Stremio API.
-let installedCache = { ts: 0, host: "", keys: [] };
-async function stremioInstalledKeys(authKey, host) {
-    if (Date.now() - installedCache.ts < 20000 && installedCache.host === host) return installedCache.keys;
+let installedCache = { ts: 0, keys: [] };
+async function stremioInstalledKeys(authKey) {
+    if (Date.now() - installedCache.ts < 20000) return installedCache.keys;
     const addons = await stremioGetAddons(authKey);
     const keys = [];
     for (const k of ["st", "fs", "hs", "ws", "pt"]) {
-        const re = new RegExp(`//${host.replace(/\./g, "\\.")}:${ADDON_PORT}/${k}/manifest\\.json$`);
+        const re = new RegExp(`/${k}/manifest\\.json$`);
         if (addons.some(a => re.test((a && a.transportUrl) || ""))) keys.push(k);
     }
-    installedCache = { ts: Date.now(), host, keys };
+    installedCache = { ts: Date.now(), keys };
     return keys;
 }
 
-// Push selected Stream Hub addons (LAN URLs) into the account, replacing any
-// previous Stream Hub entries so re-installing doesn't create duplicates.
-async function stremioInstall(authKey, host, keys) {
+// Push selected Stream Hub addons into the account with the given base origin
+// (e.g. http://192.168.1.134:7515 or https://xxx.trycloudflare.com), replacing
+// any previous Stream Hub entries so re-installing doesn't create duplicates.
+async function stremioInstall(authKey, base, keys) {
     let addons = await stremioGetAddons(authKey);
-    // Only remove the addons we're about to (re)install, so adding one addon
-    // does not wipe the others already in the account.
-    const replacing = (a) => keys.some(k => new RegExp(`:${ADDON_PORT}/${k}/manifest\\.json$`).test((a && a.transportUrl) || ""));
+    // Only remove the addons we're about to (re)install (matched host-agnostically)
+    const replacing = (a) => keys.some(k => new RegExp(`/${k}/manifest\\.json$`).test((a && a.transportUrl) || ""));
     addons = addons.filter(a => !replacing(a));
     for (const key of keys) {
         const iface = addonInterfaces[key];
         if (!iface) continue;
         addons.push({
-            transportUrl: `http://${host}:${ADDON_PORT}/${key}/manifest.json`,
+            transportUrl: `${base}/${key}/manifest.json`,
             transportName: "",
             manifest: iface.manifest,
             flags: { official: false, protected: false },
@@ -1175,6 +1191,96 @@ async function stremioInstall(authKey, host, keys) {
     await stremioApi("addonCollectionSet", { authKey, addons });
     installedCache.ts = 0; // force a refresh of the installed-keys list
     return keys.length;
+}
+
+// ============ CLOUDFLARE TUNNEL ============
+// Gives the server a public HTTPS URL (https://xxx.trycloudflare.com), which is
+// required for TV clients (LG webOS / Samsung) and Stremio Web - they reject
+// plain-http addons from non-localhost. Free, no account, no domain.
+// The cloudflared binary path is passed by the native wrapper as argv[4]
+// (Android: nativeLibraryDir/libcloudflared.so; PC: bundled cloudflared.exe).
+// DNS is done here in Node (works on Android, unlike cloudflared's Go resolver)
+// and the resolved edge IPs are passed with --edge, bypassing cloudflared DNS.
+const CLOUDFLARED_BIN = process.argv[4] || process.env.STREAMHUB_CLOUDFLARED || "";
+let tunnelUrl = "";
+let tunnelProc = null;
+let tunnelStarting = false;
+
+function tunnelAvailable() { return !!CLOUDFLARED_BIN; }
+function tunnelActive() { return !!(config.tunnelEnabled && tunnelUrl); }
+
+// Origin used when writing addon URLs into the Stremio account.
+function accountBase() {
+    if (tunnelActive()) return tunnelUrl;
+    return "http://" + accountHost() + ":" + ADDON_PORT;
+}
+
+function resolveEdges() {
+    return new Promise((resolve) => {
+        const edges = [];
+        let pending = 2;
+        const done = () => { if (--pending === 0) resolve(edges); };
+        for (const h of ["region1.v2.argotunnel.com", "region2.v2.argotunnel.com"]) {
+            dns.resolve4(h, (e, a) => { if (!e && a) for (const ip of a.slice(0, 2)) edges.push(ip + ":7844"); done(); });
+        }
+    });
+}
+
+async function startTunnel() {
+    if (!config.tunnelEnabled || !CLOUDFLARED_BIN || tunnelProc || tunnelStarting) return;
+    tunnelStarting = true;
+    try {
+        const reg = await axios.post("https://api.trycloudflare.com/tunnel", "", {
+            headers: { "Content-Type": "application/json" }, timeout: 20000, validateStatus: () => true,
+        });
+        const r = reg.data && reg.data.result;
+        if (!r || !r.hostname) throw new Error("register failed (status " + reg.status + ")");
+        const credsFile = path.join(__dirname, "tunnel_creds.json");
+        const cfgFile = path.join(__dirname, "tunnel_config.yml");
+        fs.writeFileSync(credsFile, JSON.stringify({ AccountTag: r.account_tag, TunnelID: r.id, TunnelSecret: r.secret }));
+        fs.writeFileSync(cfgFile, `tunnel: ${r.id}\ncredentials-file: ${credsFile}\ningress:\n  - hostname: ${r.hostname}\n    service: http://localhost:${ADDON_PORT}\n  - service: http_status:404\n`);
+        const edges = await resolveEdges();
+        const args = ["tunnel", "--config", cfgFile, "--edge-ip-version", "4", "--no-autoupdate"];
+        for (const e of edges) args.push("--edge", e);
+        args.push("run", r.id);
+        tunnelProc = spawn(CLOUDFLARED_BIN, args, { cwd: __dirname });
+        if (tunnelProc.stdout) tunnelProc.stdout.on("data", () => {});
+        if (tunnelProc.stderr) tunnelProc.stderr.on("data", (d) => { const s = "" + d; if (/\bERR\b|error|failed/i.test(s)) console.log("[TUNNEL]", s.trim().slice(0, 200)); });
+        tunnelProc.on("error", (e) => { console.log("[TUNNEL] spawn error:", e.message); tunnelProc = null; tunnelUrl = ""; });
+        tunnelProc.on("exit", (code) => {
+            console.log("[TUNNEL] exited", code); tunnelProc = null; tunnelUrl = "";
+            if (config.tunnelEnabled) setTimeout(() => startTunnel().catch(() => {}), 8000);
+        });
+        tunnelUrl = "https://" + r.hostname;
+        console.log("[TUNNEL] URL:", tunnelUrl);
+        // let it connect + DNS propagate, then push the new URL to the account
+        setTimeout(() => autoReinstallTunnel().catch(() => {}), 16000);
+    } catch (e) {
+        console.error("[TUNNEL] start error:", e.message);
+        tunnelUrl = "";
+    } finally {
+        tunnelStarting = false;
+    }
+}
+
+function stopTunnel() {
+    if (tunnelProc) { try { tunnelProc.kill(); } catch (e) {} }
+    tunnelProc = null;
+    tunnelUrl = "";
+}
+
+// The quick-tunnel URL changes on every (re)start; re-push whatever addons are
+// already in the account so it always points at the current https URL.
+async function autoReinstallTunnel() {
+    if (!config.stremioAuthKey || !tunnelActive()) return;
+    try {
+        const addons = await stremioGetAddons(config.stremioAuthKey);
+        const have = ["st", "fs", "hs", "ws", "pt"].filter(k => addons.some(a => new RegExp(`/${k}/manifest\\.json$`).test((a && a.transportUrl) || "")));
+        if (have.length) {
+            await stremioInstall(config.stremioAuthKey, accountBase(), have);
+            console.log("[TUNNEL] re-registered", have.join(","), "->", tunnelUrl);
+        }
+    } catch (e) { console.log("[TUNNEL] auto-reinstall:", e.message); }
 }
 
 // ============ PROXY ============
@@ -1282,6 +1388,9 @@ function startProxyServer() {
                 lanHostname: preferredHostname(),
                 hostnameAvailable: !!preferredHostname(),
                 useHostname: !!config.useHostname,
+                tunnelAvailable: tunnelAvailable(),
+                tunnelEnabled: !!config.tunnelEnabled,
+                tunnelUrl: tunnelUrl || "",
                 stremio: { loggedIn: !!config.stremioAuthKey, user: config.stremioUser || "" },
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
                 fs: { loggedIn: fsLoggedIn, unlimited: fsUnlimited, user: fsUser },
@@ -1314,6 +1423,28 @@ function startProxyServer() {
                     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                     res.end(JSON.stringify({ ok: true, lanMode: config.lanMode, lanIps: getLanIps() }));
                     setTimeout(() => rebindServers().catch(e => console.error("[LAN] Rebind error:", e.message)), 500);
+                } catch (e) {
+                    res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
+            return;
+        }
+
+        // ---- CLOUDFLARE TUNNEL TOGGLE (public HTTPS for TV / Stremio Web) ----
+        if (req.url === "/api/tunnel" && req.method === "POST") {
+            let body = "";
+            req.on("data", c => body += c);
+            req.on("end", () => {
+                try {
+                    const { enabled } = JSON.parse(body);
+                    config.tunnelEnabled = !!enabled;
+                    saveConfig(config);
+                    installedCache.ts = 0;
+                    if (config.tunnelEnabled) { startTunnel().catch(e => console.error("[TUNNEL]", e.message)); }
+                    else { stopTunnel(); }
+                    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: true, tunnelEnabled: config.tunnelEnabled, tunnelAvailable: tunnelAvailable() }));
                 } catch (e) {
                     res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                     res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -1383,7 +1514,7 @@ function startProxyServer() {
             try {
                 if (/[?&]fresh=1/.test(req.url)) installedCache.ts = 0; // pull-to-refresh forces a live check
                 if (!config.stremioAuthKey) { res.end(JSON.stringify({ ok: true, keys: [] })); return; }
-                const keys = await stremioInstalledKeys(config.stremioAuthKey, accountHost());
+                const keys = await stremioInstalledKeys(config.stremioAuthKey);
                 res.end(JSON.stringify({ ok: true, keys }));
             } catch (e) {
                 res.end(JSON.stringify({ ok: false, keys: [], error: e.message }));
@@ -1400,12 +1531,12 @@ function startProxyServer() {
                     if (!config.stremioAuthKey) throw new Error("not logged in");
                     const parsed = body ? JSON.parse(body) : {};
                     const keys = (parsed.keys && parsed.keys.length) ? parsed.keys : ["st", "fs", "hs", "ws", "pt"];
-                    // hostname (survives IP changes) or LAN IP, so remote devices reach the server
-                    const host = accountHost();
-                    const count = await stremioInstall(config.stremioAuthKey, host, keys);
-                    console.log(`[STREMIO] Installed ${count} addons into account (host ${host})`);
+                    // tunnel https URL, or hostname/LAN IP, so remote devices reach the server
+                    const base = accountBase();
+                    const count = await stremioInstall(config.stremioAuthKey, base, keys);
+                    console.log(`[STREMIO] Installed ${count} addons into account (${base})`);
                     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                    res.end(JSON.stringify({ ok: true, count, host, lanMode: !!config.lanMode }));
+                    res.end(JSON.stringify({ ok: true, count, base, tunnel: tunnelActive() }));
                 } catch (e) {
                     console.error("[STREMIO] Install error:", e.message);
                     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -1898,6 +2029,15 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
         <button class="update-btn" id="hostBtn" onclick="hostToggle()">...</button>
     </div>
 
+    <div class="update-bar" id="tunBar">
+        <div class="update-info">
+            <span class="update-title" id="tunTitle">HTTPS pre TV (tunel)</span>
+            <span class="update-status" id="tunStatus">...</span>
+        </div>
+        <button class="update-btn" id="tunBtn" onclick="tunToggle()">...</button>
+    </div>
+    <div id="tunUrl" style="font-size:11px; color:#9ca3af; padding:0 6px 10px; word-break:break-all; line-height:1.6;"></div>
+
     <div class="login-panel open" id="stremioBox" style="animation:none;">
         <div class="panel-title" id="stremioTitle">Prihlásiť do Stremio</div>
         <input type="text" id="stremioEmail" placeholder="Stremio email">
@@ -1946,6 +2086,8 @@ const T = {
         netAll: "dostupné pre všetky zariadenia", netLocal: "len toto zariadenie",
         pullRefresh: "Potiahnite pre obnovenie", pullRelease: "Pustite pre obnovenie", refreshing: "Obnovujem...",
         hostTitle: "Názov namiesto IP", hostNA: "Nedostupné na tomto zariadení",
+        tunTitle: "HTTPS pre TV (tunel)", tunNA: "Nedostupné (chýba cloudflared)",
+        tunStarting: "Spúšťam tunel...", tunHint: "Táto HTTPS adresa funguje aj na LG/Samsung TV. Zapíš doplnky do účtu (tlačidlom Pridať) a TV ich nasynchronizuje.",
         add: "Pridať", login: "Login", signIn: "Prihlásiť", signOut: "Odhlásiť",
         hintUsernameEmail: "Meno/Email", hintPassword: "Heslo",
         fillUsernamePassword: "Vyplňte meno a heslo", fillEmailPassword: "Vyplňte email a heslo",
@@ -1976,6 +2118,8 @@ const T = {
         netAll: "dostupné pro všechna zařízení", netLocal: "jen toto zařízení",
         pullRefresh: "Táhněte pro obnovení", pullRelease: "Pusťte pro obnovení", refreshing: "Obnovuji...",
         hostTitle: "Název místo IP", hostNA: "Nedostupné na tomto zařízení",
+        tunTitle: "HTTPS pro TV (tunel)", tunNA: "Nedostupné (chybí cloudflared)",
+        tunStarting: "Spouštím tunel...", tunHint: "Tato HTTPS adresa funguje i na LG/Samsung TV. Zapiš doplňky do účtu (tlačítkem Přidat) a TV je nasynchronizuje.",
         add: "Přidat", login: "Login", signIn: "Přihlásit", signOut: "Odhlásit",
         hintUsernameEmail: "Jméno/Email", hintPassword: "Heslo",
         fillUsernamePassword: "Vyplňte jméno a heslo", fillEmailPassword: "Vyplňte email a heslo",
@@ -2006,6 +2150,8 @@ const T = {
         netAll: "reachable by all devices", netLocal: "this device only",
         pullRefresh: "Pull to refresh", pullRelease: "Release to refresh", refreshing: "Refreshing...",
         hostTitle: "Hostname instead of IP", hostNA: "Not available on this device",
+        tunTitle: "HTTPS for TV (tunnel)", tunNA: "Not available (cloudflared missing)",
+        tunStarting: "Starting tunnel...", tunHint: "This HTTPS address works on LG/Samsung TVs too. Add the addons to your account (Add button) and the TV syncs them.",
         add: "Add", login: "Login", signIn: "Sign in", signOut: "Sign out",
         hintUsernameEmail: "Username/Email", hintPassword: "Password",
         fillUsernamePassword: "Enter username and password", fillEmailPassword: "Enter email and password",
@@ -2086,8 +2232,10 @@ function applyStrings() {
     // LAN + Stremio account panel
     document.getElementById("lanTitle").textContent = t("lanTitle");
     document.getElementById("hostTitle").textContent = t("hostTitle");
+    document.getElementById("tunTitle").textContent = t("tunTitle");
     document.getElementById("stremioTitle").textContent = t("strTitle");
     renderLanUI();
+    renderTunnelUI();
 }
 
 // ---- LAN mode ----
@@ -2097,6 +2245,45 @@ let lanHostname = "";
 let useHostname = false;
 let hostnameAvailable = false;
 let stremioLoggedIn = false;
+let tunnelAvailable = false;
+let tunnelEnabled = false;
+let tunnelUrl = "";
+
+// Account install works when signed in AND the server is reachable remotely -
+// either via LAN or via the HTTPS tunnel.
+function accountReady() { return stremioLoggedIn && (lanMode || (tunnelEnabled && tunnelUrl)); }
+
+function renderTunnelUI() {
+    const bar = document.getElementById("tunBar");
+    const st = document.getElementById("tunStatus");
+    const btn = document.getElementById("tunBtn");
+    const urlEl = document.getElementById("tunUrl");
+    bar.style.opacity = tunnelAvailable ? "1" : "0.45";
+    btn.disabled = !tunnelAvailable;
+    if (!tunnelAvailable) {
+        st.textContent = t("tunNA"); st.style.color = "#fbbf24";
+        btn.textContent = t("lanEnable"); urlEl.textContent = ""; return;
+    }
+    btn.textContent = tunnelEnabled ? t("lanDisable") : t("lanEnable");
+    if (tunnelEnabled && tunnelUrl) {
+        st.textContent = t("lanOn"); st.style.color = "#34d399";
+        urlEl.innerHTML = "<b>" + tunnelUrl + "</b><br>" + t("tunHint");
+    } else if (tunnelEnabled) {
+        st.textContent = t("tunStarting"); st.style.color = "#fbbf24"; urlEl.textContent = "";
+    } else {
+        st.textContent = t("lanOff"); st.style.color = "#9ca3af"; urlEl.textContent = "";
+    }
+}
+
+async function tunToggle() {
+    const btn = document.getElementById("tunBtn");
+    btn.disabled = true;
+    try { await fetch(API + "/api/tunnel", { method: "POST", body: JSON.stringify({ enabled: !tunnelEnabled }) }); } catch (e) {}
+    // tunnel takes ~15s to get a URL; poll a few times
+    setTimeout(async () => { await loadStatus(true); btn.disabled = !tunnelAvailable; }, 2000);
+    setTimeout(() => loadStatus(true), 10000);
+    setTimeout(() => loadStatus(true), 18000);
+}
 
 function renderLanUI() {
     document.getElementById("lanStatus").textContent = lanMode ? t("lanOn") : t("lanOff");
@@ -2132,7 +2319,7 @@ async function refreshInstalled(force) {
     } catch (e) { /* keep previous */ }
 }
 function updateAddButtons() {
-    const account = lanMode && stremioLoggedIn;
+    const account = accountReady();
     ["hs", "pt", "st", "fs", "ws"].forEach(k => {
         const b = document.querySelector("#card-" + k + " .btn-add");
         if (!b) return;
@@ -2252,7 +2439,11 @@ async function loadStatus(force) {
         lanHostname = s.lanHostname || "";
         useHostname = !!s.useHostname;
         hostnameAvailable = !!s.hostnameAvailable;
+        tunnelAvailable = !!s.tunnelAvailable;
+        tunnelEnabled = !!s.tunnelEnabled;
+        tunnelUrl = s.tunnelUrl || "";
         renderLanUI();
+        renderTunnelUI();
         stremioLoggedIn = !!(s.stremio && s.stremio.loggedIn);
         const strMsg = document.getElementById("stremioMsg");
         if (stremioLoggedIn) {
@@ -2261,8 +2452,8 @@ async function loadStatus(force) {
             document.getElementById("stremioLogoutBtn").classList.remove("hidden");
             document.getElementById("stremioPassword").classList.add("hidden");
             document.getElementById("stremioAuthKey").classList.add("hidden");
-            // Per-addon install works only with LAN on; guide the user otherwise
-            if (!lanMode) { strMsg.style.color = "#fbbf24"; strMsg.textContent = t("strNeedLan"); }
+            // Account install needs LAN or the tunnel; guide the user otherwise
+            if (!lanMode && !(tunnelEnabled && tunnelUrl)) { strMsg.style.color = "#fbbf24"; strMsg.textContent = t("strNeedLan"); }
             else if (!strMsg.dataset.keep) { strMsg.textContent = ""; }
         } else {
             document.getElementById("stremioLoginBtn").classList.remove("hidden");
@@ -2271,7 +2462,7 @@ async function loadStatus(force) {
             document.getElementById("stremioAuthKey").classList.remove("hidden");
         }
         // Detect which addons are already in the account (shows "Nainštalované")
-        if (lanMode && stremioLoggedIn) { await refreshInstalled(force); } else { installedKeys = []; }
+        if (accountReady()) { await refreshInstalled(force); } else { installedKeys = []; }
         updateAddButtons();
 
         const running = s.serverRunning;
@@ -2428,8 +2619,8 @@ async function toggleServer() {
 }
 
 function installOne(key) {
-    // LAN + Stremio account active -> add straight into the account.
-    if (lanMode && stremioLoggedIn) return accountInstall(key);
+    // Stremio account + reachable server (LAN or tunnel) -> add into the account.
+    if (accountReady()) return accountInstall(key);
     // Otherwise the normal local install: copy URL + open the stremio:// link.
     const url = addonUrls[key];
     if (!url) return;
@@ -2888,6 +3079,19 @@ function startAddonServer() {
 
         const url = req.url.replace(/\?.*$/, "");
 
+        // Stream proxy paths also served here (forwarded to the proxy server on
+        // 7516) so a single tunnel origin covers everything - the tunnel points
+        // only at 7515, and stream URLs are rewritten to this same origin.
+        if (/^\/(proxy|fsproxy|ptproxy|wsproxy)\//.test(url)) {
+            const preq = http.request({ host: "127.0.0.1", port: PROXY_PORT, path: req.url, method: req.method, headers: req.headers }, (pres) => {
+                res.writeHead(pres.statusCode || 502, pres.headers);
+                pres.pipe(res);
+            });
+            preq.on("error", () => { if (!res.headersSent) res.writeHead(502); res.end(); });
+            req.pipe(preq);
+            return;
+        }
+
         // Route: /{prefix}/manifest.json or /{prefix}/{resource}/{type}/{id}.json
         // /configure on main port
         if (url === "/configure" || url === "/configure/" || url === "/" || url === "") {
@@ -3015,6 +3219,7 @@ async function start() {
     startProxyServer();
     startAddonServer();
     startMdns(); // advertise streamhub.local over mDNS (best effort)
+    if (config.tunnelEnabled && tunnelAvailable()) startTunnel().catch(e => console.error("[TUNNEL]", e.message));
 
     (async () => {
         await loginAllFromConfig();
