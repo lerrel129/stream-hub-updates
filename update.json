@@ -1,7 +1,7 @@
 {
-  "version": 22,
+  "version": 23,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.9: free HTTPS tunnel (Cloudflare) - works on LG/Samsung TV & Stremio Web; addons install into your account over https and sync to the TV, nothing installed on the TV",
-  "apkVersion": 33,
+  "notes": "v2.9: oprava tunela na Androide (DNS cez DoH + zalozne edge IP), zobrazenie chyby tunela v UI, automaticke opakovanie registracie",
+  "apkVersion": 34,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
