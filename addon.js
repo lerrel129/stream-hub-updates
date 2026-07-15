@@ -17,7 +17,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 22;
+const APP_VERSION = 23;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1205,6 +1205,15 @@ const CLOUDFLARED_BIN = process.argv[4] || process.env.STREAMHUB_CLOUDFLARED || 
 let tunnelUrl = "";
 let tunnelProc = null;
 let tunnelStarting = false;
+let tunnelLastErr = "";     // last failure reason, shown in the UI while stuck
+let tunnelStderrTail = "";  // last cloudflared output, for diagnostics
+let tunnelRetryTimer = null;
+
+function scheduleTunnelRetry(ms) {
+    if (!config.tunnelEnabled) return;
+    if (tunnelRetryTimer) clearTimeout(tunnelRetryTimer);
+    tunnelRetryTimer = setTimeout(() => { tunnelRetryTimer = null; startTunnel().catch(() => {}); }, ms);
+}
 
 function tunnelAvailable() { return !!CLOUDFLARED_BIN; }
 function tunnelActive() { return !!(config.tunnelEnabled && tunnelUrl); }
@@ -1215,15 +1224,40 @@ function accountBase() {
     return "http://" + accountHost() + ":" + ADDON_PORT;
 }
 
-function resolveEdges() {
+// Known argotunnel edge IPs (region1/region2), used when every DNS path fails.
+// On Android neither Node's c-ares resolver (dns.resolve4) nor cloudflared's
+// Go resolver can read the system DNS servers (no /etc/resolv.conf), so the
+// edge list MUST always be non-empty or cloudflared dies instantly.
+const FALLBACK_EDGES = [
+    "198.41.192.7", "198.41.192.47", "198.41.192.107", "198.41.192.227",
+    "198.41.200.13", "198.41.200.53", "198.41.200.113", "198.41.200.193",
+];
+
+function dnsResolve4(host) {
     return new Promise((resolve) => {
-        const edges = [];
-        let pending = 2;
-        const done = () => { if (--pending === 0) resolve(edges); };
-        for (const h of ["region1.v2.argotunnel.com", "region2.v2.argotunnel.com"]) {
-            dns.resolve4(h, (e, a) => { if (!e && a) for (const ip of a.slice(0, 2)) edges.push(ip + ":7844"); done(); });
-        }
+        const to = setTimeout(() => resolve([]), 4000);
+        dns.resolve4(host, (e, a) => { clearTimeout(to); resolve(!e && a ? a : []); });
     });
+}
+
+// DNS-over-HTTPS straight to 1.1.1.1 by IP - needs no working DNS at all.
+async function dohResolve4(host) {
+    try {
+        const r = await axios.get("https://1.1.1.1/dns-query", {
+            params: { name: host, type: "A" },
+            headers: { accept: "application/dns-json" }, timeout: 8000,
+        });
+        return ((r.data && r.data.Answer) || []).filter(a => a.type === 1).map(a => a.data);
+    } catch (e) { return []; }
+}
+
+async function resolveEdges() {
+    const hosts = ["region1.v2.argotunnel.com", "region2.v2.argotunnel.com"];
+    let ips = [];
+    for (const h of hosts) ips.push(...(await dnsResolve4(h)).slice(0, 2));
+    if (!ips.length) for (const h of hosts) ips.push(...(await dohResolve4(h)).slice(0, 2));
+    if (!ips.length) ips = FALLBACK_EDGES.slice();
+    return [...new Set(ips)].slice(0, 8).map(ip => ip + ":7844");
 }
 
 async function startTunnel() {
@@ -1243,31 +1277,49 @@ async function startTunnel() {
         const args = ["tunnel", "--config", cfgFile, "--edge-ip-version", "4", "--no-autoupdate"];
         for (const e of edges) args.push("--edge", e);
         args.push("run", r.id);
+        tunnelStderrTail = "";
         tunnelProc = spawn(CLOUDFLARED_BIN, args, { cwd: __dirname });
         if (tunnelProc.stdout) tunnelProc.stdout.on("data", () => {});
-        if (tunnelProc.stderr) tunnelProc.stderr.on("data", (d) => { const s = "" + d; if (/\bERR\b|error|failed/i.test(s)) console.log("[TUNNEL]", s.trim().slice(0, 200)); });
-        tunnelProc.on("error", (e) => { console.log("[TUNNEL] spawn error:", e.message); tunnelProc = null; tunnelUrl = ""; });
+        if (tunnelProc.stderr) tunnelProc.stderr.on("data", (d) => {
+            const s = "" + d;
+            tunnelStderrTail = (tunnelStderrTail + s).slice(-500);
+            if (/\bERR\b|error|failed/i.test(s)) console.log("[TUNNEL]", s.trim().slice(0, 200));
+        });
+        tunnelProc.on("error", (e) => {
+            console.log("[TUNNEL] spawn error:", e.message);
+            tunnelLastErr = "cloudflared spawn: " + e.message;
+            tunnelProc = null; tunnelUrl = "";
+            scheduleTunnelRetry(15000);
+        });
         tunnelProc.on("exit", (code) => {
-            console.log("[TUNNEL] exited", code); tunnelProc = null; tunnelUrl = "";
-            if (config.tunnelEnabled) setTimeout(() => startTunnel().catch(() => {}), 8000);
+            console.log("[TUNNEL] exited", code);
+            const tail = tunnelStderrTail.trim().split(/\r?\n/).filter(l => /\bERR\b|error|failed/i.test(l)).pop() || tunnelStderrTail.trim().slice(-160);
+            tunnelLastErr = "cloudflared exited (code " + code + ")" + (tail ? ": " + tail.slice(0, 200) : "");
+            tunnelProc = null; tunnelUrl = "";
+            scheduleTunnelRetry(8000);
         });
         tunnelUrl = "https://" + r.hostname;
+        tunnelLastErr = "";
         console.log("[TUNNEL] URL:", tunnelUrl);
         // push the new URL to the account, but only once it is actually live
         // (the quick-tunnel URL changes every restart + needs DNS propagation)
         setTimeout(() => autoReinstallTunnel().catch(() => {}), 3000);
     } catch (e) {
         console.error("[TUNNEL] start error:", e.message);
+        tunnelLastErr = "api.trycloudflare.com: " + e.message;
         tunnelUrl = "";
+        scheduleTunnelRetry(15000);
     } finally {
         tunnelStarting = false;
     }
 }
 
 function stopTunnel() {
+    if (tunnelRetryTimer) { clearTimeout(tunnelRetryTimer); tunnelRetryTimer = null; }
     if (tunnelProc) { try { tunnelProc.kill(); } catch (e) {} }
     tunnelProc = null;
     tunnelUrl = "";
+    tunnelLastErr = "";
 }
 
 // Wait until the current tunnel URL actually serves our manifest (tunnel
@@ -1411,6 +1463,7 @@ function startProxyServer() {
                 tunnelAvailable: tunnelAvailable(),
                 tunnelEnabled: !!config.tunnelEnabled,
                 tunnelUrl: tunnelUrl || "",
+                tunnelErr: tunnelUrl ? "" : (tunnelLastErr || ""),
                 stremio: { loggedIn: !!config.stremioAuthKey, user: config.stremioUser || "" },
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
                 fs: { loggedIn: fsLoggedIn, unlimited: fsUnlimited, user: fsUser },
@@ -2268,6 +2321,7 @@ let stremioLoggedIn = false;
 let tunnelAvailable = false;
 let tunnelEnabled = false;
 let tunnelUrl = "";
+let tunnelErr = "";
 let ptLoggedIn = false; // Prehraj.to needs a login before its addon can be added
 
 // Account install works when signed in AND the server is reachable remotely -
@@ -2286,11 +2340,14 @@ function renderTunnelUI() {
         btn.textContent = t("lanEnable"); urlEl.textContent = ""; return;
     }
     btn.textContent = tunnelEnabled ? t("lanDisable") : t("lanEnable");
+    urlEl.style.color = "#9ca3af";
     if (tunnelEnabled && tunnelUrl) {
         st.textContent = t("lanOn"); st.style.color = "#34d399";
         urlEl.innerHTML = "<b>" + tunnelUrl + "</b><br>" + t("tunHint");
     } else if (tunnelEnabled) {
-        st.textContent = t("tunStarting"); st.style.color = "#fbbf24"; urlEl.textContent = "";
+        st.textContent = t("tunStarting"); st.style.color = "#fbbf24";
+        // show the real failure reason instead of hanging silently
+        urlEl.textContent = tunnelErr; if (tunnelErr) urlEl.style.color = "#f87171";
     } else {
         st.textContent = t("lanOff"); st.style.color = "#9ca3af"; urlEl.textContent = "";
     }
@@ -2472,6 +2529,7 @@ async function loadStatus(force) {
         tunnelAvailable = !!s.tunnelAvailable;
         tunnelEnabled = !!s.tunnelEnabled;
         tunnelUrl = s.tunnelUrl || "";
+        tunnelErr = s.tunnelErr || "";
         ptLoggedIn = !!(s.pt && s.pt.loggedIn);
         renderLanUI();
         renderTunnelUI();
