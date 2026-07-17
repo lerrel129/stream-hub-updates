@@ -17,7 +17,7 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 23;
+const APP_VERSION = 24;
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
@@ -1241,15 +1241,44 @@ function dnsResolve4(host) {
 }
 
 // DNS-over-HTTPS straight to 1.1.1.1 by IP - needs no working DNS at all.
+const dohCache = new Map(); // host -> { ips, ts }
 async function dohResolve4(host) {
+    const c = dohCache.get(host);
+    if (c && Date.now() - c.ts < 300000) return c.ips;
     try {
         const r = await axios.get("https://1.1.1.1/dns-query", {
             params: { name: host, type: "A" },
             headers: { accept: "application/dns-json" }, timeout: 8000,
         });
-        return ((r.data && r.data.Answer) || []).filter(a => a.type === 1).map(a => a.data);
+        const ips = ((r.data && r.data.Answer) || []).filter(a => a.type === 1).map(a => a.data);
+        if (ips.length) dohCache.set(host, { ips, ts: Date.now() });
+        return ips;
     } catch (e) { return []; }
 }
+
+// Some networks/DNS filters blackhole *.trycloudflare.com by resolving it to
+// 0.0.0.0 (seen in the wild: "connect ECONNREFUSED 0.0.0.0:443"). For the
+// app's OWN requests, fall back to DoH when the system resolver fails or
+// returns a blackhole address. TLS still verifies the real hostname (SNI),
+// so this changes only WHERE the IP comes from, not security.
+const DNS_BLACKHOLE = new Set(["0.0.0.0", "::", "127.0.0.1", "::1"]);
+function smartLookup(hostname, options, callback) {
+    if (typeof options === "function") { callback = options; options = null; }
+    const done = (err, addr) => {
+        if (err) return callback(err);
+        if (options && options.all) callback(null, [{ address: addr, family: 4 }]);
+        else callback(null, addr, 4);
+    };
+    dns.lookup(hostname, { family: 4 }, (err, addr) => {
+        if (!err && addr && !DNS_BLACKHOLE.has(addr)) return done(null, addr);
+        dohResolve4(hostname).then(ips => {
+            const ip = ips.find(i => !DNS_BLACKHOLE.has(i));
+            if (ip) done(null, ip);
+            else done(err || new Error("DNS blocked (0.0.0.0) for " + hostname));
+        });
+    });
+}
+const cfAgent = new (require("https").Agent)({ lookup: smartLookup, keepAlive: true });
 
 async function resolveEdges() {
     const hosts = ["region1.v2.argotunnel.com", "region2.v2.argotunnel.com"];
@@ -1266,6 +1295,7 @@ async function startTunnel() {
     try {
         const reg = await axios.post("https://api.trycloudflare.com/tunnel", "", {
             headers: { "Content-Type": "application/json" }, timeout: 20000, validateStatus: () => true,
+            httpsAgent: cfAgent, // bypasses DNS filters that blackhole trycloudflare.com
         });
         const r = reg.data && reg.data.result;
         if (!r || !r.hostname) throw new Error("register failed (status " + reg.status + ")");
@@ -1330,7 +1360,7 @@ async function waitTunnelReady(timeoutMs) {
     while (Date.now() < deadline) {
         if (!tunnelUrl || tunnelUrl !== startedUrl) return false; // changed/stopped
         try {
-            const r = await axios.get(tunnelUrl + "/hs/manifest.json", { timeout: 8000, validateStatus: () => true });
+            const r = await axios.get(tunnelUrl + "/hs/manifest.json", { timeout: 8000, validateStatus: () => true, httpsAgent: cfAgent });
             if (r.status === 200) return true;
         } catch (e) {}
         await new Promise(res => setTimeout(res, 4000));
@@ -1341,18 +1371,30 @@ async function waitTunnelReady(timeoutMs) {
 // The quick-tunnel URL changes on every (re)start; re-push whatever addons are
 // already in the account so it always points at the current https URL - but
 // only after the URL is confirmed live, so the account never holds a dead URL.
+// stremioInstall() removes the old-URL entries of the same addons, so the
+// account swaps old address -> new address for exactly the installed set.
+// Keeps retrying for as long as this tunnel URL is still the current one
+// (fresh quick-tunnel hostnames can take minutes to propagate through DNS).
 async function autoReinstallTunnel() {
     if (!config.stremioAuthKey || !config.tunnelEnabled) return;
-    const ready = await waitTunnelReady(70000);
-    if (!ready || !tunnelActive()) { console.log("[TUNNEL] URL not ready - skipping account update"); return; }
-    try {
-        const addons = await stremioGetAddons(config.stremioAuthKey);
-        const have = ["st", "fs", "hs", "ws", "pt"].filter(k => addons.some(a => new RegExp(`/${k}/manifest\\.json$`).test((a && a.transportUrl) || "")));
-        if (have.length) {
-            await stremioInstall(config.stremioAuthKey, accountBase(), have);
-            console.log("[TUNNEL] re-registered", have.join(","), "->", tunnelUrl);
+    const startedUrl = tunnelUrl;
+    for (let attempt = 1; tunnelUrl && tunnelUrl === startedUrl && config.tunnelEnabled; attempt++) {
+        const ready = await waitTunnelReady(70000);
+        if (tunnelUrl !== startedUrl || !config.tunnelEnabled) return; // restarted/stopped meanwhile
+        if (!ready) { console.log(`[TUNNEL] URL not ready (attempt ${attempt}) - retrying`); continue; }
+        try {
+            const addons = await stremioGetAddons(config.stremioAuthKey);
+            const have = ["st", "fs", "hs", "ws", "pt"].filter(k => addons.some(a => new RegExp(`/${k}/manifest\\.json$`).test((a && a.transportUrl) || "")));
+            if (have.length) {
+                await stremioInstall(config.stremioAuthKey, accountBase(), have);
+                console.log("[TUNNEL] re-registered", have.join(","), "->", tunnelUrl);
+            }
+            return;
+        } catch (e) {
+            console.log(`[TUNNEL] auto-reinstall (attempt ${attempt}):`, e.message);
+            await new Promise(res => setTimeout(res, 15000));
         }
-    } catch (e) { console.log("[TUNNEL] auto-reinstall:", e.message); }
+    }
 }
 
 // ============ PROXY ============
