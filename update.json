@@ -1,7 +1,7 @@
 {
-  "version": 23,
+  "version": 24,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.9: oprava tunela na Androide (DNS cez DoH + zalozne edge IP), zobrazenie chyby tunela v UI, automaticke opakovanie registracie",
-  "apkVersion": 34,
+  "notes": "v3.0: obidenie DNS filtrov ktore blokuju trycloudflare.com (0.0.0.0); po starte tunela sa doplnky v Stremio ucte spolahlivo prepisu zo starej adresy na novu (opakuje sa az kym sa zapis nepodari, len uz nainstalovane doplnky)",
+  "apkVersion": 35,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
 }
