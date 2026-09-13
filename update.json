@@ -1,7 +1,8 @@
 {
-  "version": 18,
-  "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/addon.js",
-  "notes": "v2.5: pull-to-refresh, $ badge for paid servers, Prehraj.to needs login, server bar always shows the IP",
-  "apkVersion": 29,
-  "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/latest/download/stream-hub.apk"
+  "version": 36,
+  "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/fix/v2.5.1/addon.js",
+  "sha256": "645480209c99f229817c0282c53e35aaa64d033969c0fb179dbf5c20720d15a9",
+  "notes": "v2.5.1: opravy prihlasovania, vyhladavania, streamov, cache, LAN a aktualizacii",
+  "apkVersion": 36,
+  "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/download/v2.5.1/stream-hub.apk"
 }
