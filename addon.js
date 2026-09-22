@@ -1,5 +1,7 @@
 const { addonBuilder } = require("stremio-addon-sdk");
 const axios = require("axios");
+axios.defaults.timeout = 15000;
+const vm = require("vm");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -10,15 +12,29 @@ const API_URL = `${BASE_URL}/api/web`;
 const PROXY_PORT = 7516;
 const ADDON_PORT = 7515;
 const TMDB_API_KEY = "6886604aa36c09e80400a8732d061684";
-const CONFIG_PATH = path.join(__dirname, "config.json");
+const DATA_DIR = process.env.STREAM_HUB_DATA_DIR || __dirname;
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function persistentPath(name) {
+    const target = path.join(DATA_DIR, name);
+    const legacy = path.join(__dirname, name);
+    if (target !== legacy && !fs.existsSync(target) && fs.existsSync(legacy)) {
+        try { fs.copyFileSync(legacy, target); }
+        catch (error) { console.error(`[CONFIG] Could not migrate ${name}:`, error.message); }
+    }
+    return target;
+}
+
+const CONFIG_PATH = persistentPath("config.json");
 
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 18;
+const APP_VERSION = 37;
+const RELEASE_VERSION = "2.5.2";
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
-    "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/main/update.json";
+    "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/fix/v2.5.1/update.json";
 // Exit code used when the process terminates after downloading an update -
 // the wrapper (desktop/android) restarts the app based on it.
 const UPDATE_EXIT_CODE = 87;
@@ -74,14 +90,64 @@ function saveConfig(cfg) {
 }
 
 let config = loadConfig();
+const loginJobs = new Map();
+const loginEpoch = new Map();
+const resetSession = {
+    st: () => { sessionCookie = ""; loggedIn = false; stPremium = false; for (const id of Object.keys(streamCache)) delete streamCache[id]; },
+    fs: () => { fsCookie = ""; fsLoggedIn = false; fsUnlimited = false; fsUser = ""; },
+    ws: () => { wsToken = ""; wsLoggedIn = false; wsVip = false; wsUser = ""; },
+    pt: () => { ptCookie = ""; ptLoggedIn = false; ptUser = ""; },
+};
+function invalidateSession(key) { loginEpoch.set(key, (loginEpoch.get(key) || 0) + 1); resetSession[key](); }
+async function serializedLogin(key, credentials, action) {
+    const current = loginJobs.get(key);
+    if (current) {
+        if (current.credentials === credentials) return current.promise;
+        await current.promise;
+        return serializedLogin(key, credentials, action);
+    }
+    const epoch = loginEpoch.get(key) || 0;
+    const job = { credentials };
+    job.promise = (async () => {
+        try {
+            const ok = await action();
+            if (!ok || epoch !== (loginEpoch.get(key) || 0)) { resetSession[key](); return false; }
+            return true;
+        } finally { if (loginJobs.get(key) === job) loginJobs.delete(key); }
+    })();
+    loginJobs.set(key, job);
+    return job.promise;
+}
+function login(email, password) { return serializedLogin("st", JSON.stringify([email, password]), () => loginRaw(email, password)); }
+function fsLogin(user, password) { return serializedLogin("fs", JSON.stringify([user, password]), () => fsLoginRaw(user, password)); }
+function wsLogin(user, password) { return serializedLogin("ws", JSON.stringify([user, password]), () => wsLoginRaw(user, password)); }
+function ptLogin(email, password) { return serializedLogin("pt", JSON.stringify([email, password]), () => ptLoginRaw(email, password)); }
 
 // ============ CAPPED CACHES ============
 
 // LRU cache behind a Proxy so existing `cache[key]` syntax keeps working.
 // Prevents unbounded memory growth (important on Android where the
 // foreground service runs for days).
-function lruCache(maxEntries) {
-    const map = new Map();
+const metadataStores = new Map();
+const METADATA_PATH = persistentPath("metadata-cache.json");
+let metadataTimer = null;
+let restoredMetadata = {};
+try { restoredMetadata = JSON.parse(fs.readFileSync(METADATA_PATH, "utf8")); } catch (_) {}
+function flushMetadata() {
+    metadataTimer = null;
+    try {
+        const data = Object.fromEntries([...metadataStores].map(([key, map]) => [key, [...map]]));
+        fs.writeFileSync(METADATA_PATH + ".tmp", JSON.stringify(data), { mode: 0o600 });
+        fs.renameSync(METADATA_PATH + ".tmp", METADATA_PATH);
+    } catch (e) { console.error("[CACHE] Save failed:", e.message); }
+}
+function scheduleMetadataSave() {
+    if (!metadataTimer) { metadataTimer = setTimeout(flushMetadata, 300); metadataTimer.unref?.(); }
+}
+function lruCache(maxEntries, persistentKey) {
+    const entries = restoredMetadata[persistentKey];
+    const map = new Map(Array.isArray(entries) ? entries.filter(e => Array.isArray(e) && e.length === 2).slice(-maxEntries) : []);
+    if (persistentKey) metadataStores.set(persistentKey, map);
     return new Proxy({}, {
         get(_, key) {
             if (typeof key !== "string") return undefined;
@@ -94,10 +160,11 @@ function lruCache(maxEntries) {
             if (map.has(key)) map.delete(key);
             map.set(key, val);
             if (map.size > maxEntries) map.delete(map.keys().next().value);
+            if (persistentKey) scheduleMetadataSave();
             return true;
         },
         has(_, key) { return map.has(key); },
-        deleteProperty(_, key) { map.delete(key); return true; },
+        deleteProperty(_, key) { map.delete(key); if (persistentKey) scheduleMetadataSave(); return true; },
         ownKeys() { return [...map.keys()]; },
         getOwnPropertyDescriptor(_, key) {
             if (!map.has(key)) return undefined;
@@ -108,14 +175,57 @@ function lruCache(maxEntries) {
 
 // ============ SLEDUJTETO ============
 
-const urlCache = lruCache(2000);
-const metaCache = lruCache(2000);
-const fileDataCache = lruCache(2000);
+const urlCache = lruCache(2000, "urlCache");
+const metaCache = lruCache(2000, "metaCache");
+const fileDataCache = lruCache(2000, "fileDataCache");
 const streamCache = lruCache(500);
+const searchResultCache = lruCache(500);
 let sessionCookie = "";
 let loggedIn = false;
 let stPremium = false;
 let serverRunning = true;
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function cachedSearch(kind, query, searchFn, ttlMs = 5 * 60 * 1000) {
+    const key = `${kind}:${String(query || "").trim().toLowerCase()}`;
+    const cached = searchResultCache[key];
+    if (cached && Date.now() - cached.ts < ttlMs) return cached.results;
+    const results = await searchFn(query);
+    if (results?.length) searchResultCache[key] = { ts: Date.now(), results };
+    return results;
+}
+
+async function searchQueryVariants(kind, queries, searchFn, getId, timeoutMs = 12000) {
+    const completed = [];
+    const uniqueQueries = [...new Set(queries.filter(Boolean))];
+    const tasks = uniqueQueries.map(async query => {
+        try {
+            completed.push(await cachedSearch(kind, query, searchFn) || []);
+        } catch (error) {
+            console.error(`[SEARCH] ${kind} '${query}' failed:`, error.message);
+        }
+    });
+    await Promise.race([Promise.allSettled(tasks), delay(timeoutMs)]);
+
+    const seen = new Set();
+    const merged = [];
+    for (const results of completed) {
+        for (const item of results) {
+            const id = getId(item);
+            if (id && !seen.has(id)) {
+                seen.add(id);
+                merged.push(item);
+            }
+        }
+    }
+    if (completed.length < uniqueQueries.length) {
+        console.log(`[SEARCH] ${kind}: returning ${merged.length} results after ${timeoutMs}ms (${completed.length}/${uniqueQueries.length} queries finished)`);
+    }
+    return merged;
+}
 
 function mergeCookies(existing, newCookies) {
     const map = {};
@@ -128,36 +238,24 @@ function mergeCookies(existing, newCookies) {
 function api(url, opts = {}) {
     return axios({
         url, timeout: 15000,
+        ...opts,
         headers: {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
             "X-Requested-With": "XMLHttpRequest", "Accept": "application/json", "Referer": BASE_URL,
             ...(sessionCookie ? { Cookie: sessionCookie } : {}), ...(opts.headers || {}),
         },
         maxRedirects: opts.followRedirects === false ? 0 : 5,
-        validateStatus: () => true, ...opts,
+        validateStatus: () => true,
     });
 }
 
 function detectPremium(html) {
-    const idx = html.indexOf("Premium:");
-    if (idx >= 0) {
-        const after = html.substring(idx, Math.min(idx + 200, html.length)).toLowerCase();
-        if (after.includes("aktivn")) {
-            console.log("[PREMIUM] SledujTeTo: ✓ aktivní");
-            return true;
-        }
-    }
-    // fallback
-    const lower = html.toLowerCase();
-    if (lower.includes("premium") && lower.includes("aktivn")) {
-        console.log("[PREMIUM] SledujTeTo: ✓ (fallback)");
-        return true;
-    }
-    console.log("[PREMIUM] SledujTeTo: ✗");
-    return false;
+    const plain = stripDiacritics(html.replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ")).toLowerCase();
+    const match = plain.match(/premium\s*:\s*(neaktivni|neaktivne|aktivni|aktivne)\b/);
+    return !!match && /^aktivn/.test(match[1]);
 }
 
-async function login(email, password) {
+async function loginRaw(email, password) {
     try {
         const page = await axios.get(`${BASE_URL}/account/login/`, {
             headers: { "User-Agent": "Mozilla/5.0" }, maxRedirects: 5,
@@ -180,7 +278,6 @@ async function login(email, password) {
 
         const newCookies = (resp.headers["set-cookie"] || []).map(c => c.split(";")[0]);
         if (newCookies.length) sessionCookie = mergeCookies(sessionCookie, newCookies);
-        console.log("[LOGIN] After POST cookies:", sessionCookie.substring(0, 120));
 
         const code = resp.status;
         const location = resp.headers.location || "";
@@ -192,7 +289,6 @@ async function login(email, password) {
             });
             const moreCookies = (follow.headers["set-cookie"] || []).map(c => c.split(";")[0]);
             if (moreCookies.length) sessionCookie = mergeCookies(sessionCookie, moreCookies);
-            console.log("[LOGIN] After redirect cookies:", sessionCookie.substring(0, 120));
 
             // Detect premium from redirect page
             const body = typeof follow.data === "string" ? follow.data : "";
@@ -211,7 +307,6 @@ async function login(email, password) {
 
 async function checkPremiumStatus() {
     try {
-        console.log("[PREMIUM] Checking... cookies:", sessionCookie.substring(0, 80));
         const resp = await axios.get(`${BASE_URL}/account/dashboard/?page=1`, {
             headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -324,19 +419,6 @@ function stFormatName(videoName, fd, imdbId) {
     const flags = new Set();
     if (info.flag === "🇸🇰") flags.add("🇸🇰");
     if (info.flag === "🇨🇿") flags.add("🇨🇿");
-    // Title-based detection from TMDB
-    if (imdbId) {
-        const cached = tmdbCache[imdbId];
-        if (cached) {
-            const lower = (videoName || "").toLowerCase();
-            const norm = stripDiacritics(lower);
-            const czNorm = cached.czTitle ? stripDiacritics(cached.czTitle.toLowerCase()) : "";
-            const skNorm = cached.skTitle ? stripDiacritics(cached.skTitle.toLowerCase()) : "";
-            const sameTitles = czNorm && skNorm && czNorm === skNorm;
-            if (skNorm && !sameTitles && (lower.includes(cached.skTitle.toLowerCase()) || norm.includes(skNorm))) flags.add("🇸🇰");
-            if (czNorm && (lower.includes(cached.czTitle.toLowerCase()) || norm.includes(czNorm))) flags.add("🇨🇿");
-        }
-    }
     const parts = [...flags];
     if (fd?.resolution) {
         const w = parseInt(fd.resolution);
@@ -351,6 +433,17 @@ function stFormatDesc(videoName, fd) {
     if (fd?.duration) parts.push("⏱ " + fd.duration);
     if (fd?.filesize) parts.push("💾 " + fd.filesize);
     return parts.join("\n");
+}
+
+function makeStStream(vid, imdbId) {
+    const fd = fileDataCache[vid];
+    const name = fd?.name || "";
+    return {
+        url: `http://127.0.0.1:${PROXY_PORT}/proxy/${vid}`,
+        name: `${stLabel()}\n${stFormatName(name, fd, imdbId)}`,
+        description: stFormatDesc(name, fd),
+        behaviorHints: { notWebReady: true },
+    };
 }
 
 // ============ AUDIO DETECTION (shared) ============
@@ -377,9 +470,9 @@ let fsCookie = "";
 let fsLoggedIn = false;
 let fsUnlimited = false;
 let fsUser = "";
-const fsFileCache = lruCache(1000);
+const fsFileCache = lruCache(1000, "fsFileCache");
 
-async function fsLogin(username, password) {
+async function fsLoginRaw(username, password) {
     try {
         const url = `https://fastshare.cz/api/api_kodi.php?process=login&login=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
         const resp = await axios.get(url, { headers: { "User-Agent": "Mozilla/5.0" } });
@@ -407,7 +500,7 @@ function makeFsTerm(query) {
 async function fsSearch(query) {
     if (!query) return [];
     try {
-        const searchUrl = `https://fastshare.cloud/${query.replace(/ /g, "-")}/s`;
+        const searchUrl = `https://fastshare.cloud/${encodeURIComponent(query.replace(/ /g, "-"))}/s`;
         const searchResp = await axios.get(searchUrl, {
             headers: { "User-Agent": "Mozilla/5.0", ...(fsCookie ? { Cookie: fsCookie } : {}) },
         });
@@ -446,7 +539,7 @@ async function fsSearch(query) {
             const size = (detailMatches[3] || detailMatches[2] || "").trim();
             const audio = detectAudio(fileName);
             const idM = dlHref.match(/[?&]id=(\d+)/);
-            const fsId = idM ? idM[1] : String(dlHref.hashCode || Math.random());
+            const fsId = idM ? idM[1] : require("crypto").createHash("sha256").update(dlHref).digest("hex").slice(0, 24);
             const file = { name: fileName, size, duration, resolution, downloadUrl: dlHref, audioTracks: audio, fsId };
             fsFileCache[fsId] = file;
             files.push(file);
@@ -479,7 +572,7 @@ function fsFormatDesc(file) {
 
 // ============ HELLSPY ============
 
-const hsFileCache = lruCache(1000);
+const hsFileCache = lruCache(1000, "hsFileCache");
 
 async function hsSearch(query) {
     if (!query) return [];
@@ -572,11 +665,13 @@ async function tmdbGetNames(imdbId) {
 async function buildImdbQueries(imdbId, season, episode) {
     const { names, year } = await tmdbGetNames(imdbId);
     if (!names.length) return { queries: [], epTag: "" };
-    const epTag = (season && episode) ? `S${String(season).padStart(2,"0")}E${String(episode).padStart(2,"0")}` : "";
+    const epTag = (Number.isInteger(season) && season >= 0 && Number.isInteger(episode) && episode >= 0) ? `S${String(season).padStart(2,"0")}E${String(episode).padStart(2,"0")}` : "";
     const queries = [];
     for (const n of names) {
-        if (epTag) queries.push(`${n} ${epTag}`);
-        queries.push(year ? `${n} ${year}` : n);
+        if (epTag) {
+            queries.push(`${n} ${epTag}`, `${n} ${season}x${String(episode).padStart(2, "0")}`);
+        } else if (year) queries.push(`${n} ${year}`);
+        queries.push(n);
     }
     console.log(`[TMDB] Queries for ${imdbId}${epTag ? " " + epTag : ""}:`, queries);
     return { queries, epTag, season, episode };
@@ -586,58 +681,22 @@ function stripDiacritics(str) {
     return str.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
 
-function enhanceAudioByTitle(files, nameField, imdbId) {
-    const cached = tmdbCache[imdbId];
-    if (!cached || (!cached.czTitle && !cached.skTitle)) return;
-    const czNorm = cached.czTitle ? stripDiacritics(cached.czTitle.toLowerCase()) : "";
-    const skNorm = cached.skTitle ? stripDiacritics(cached.skTitle.toLowerCase()) : "";
-    const czExact = cached.czTitle ? cached.czTitle.toLowerCase() : "";
-    const skExact = cached.skTitle ? cached.skTitle.toLowerCase() : "";
-    // skip if CZ and SK titles are identical after normalization
-    const sameTitles = czNorm && skNorm && czNorm === skNorm;
-    for (const f of files) {
-        const fnLower = (f[nameField] || "").toLowerCase();
-        const fnNorm = stripDiacritics(fnLower);
-        let audio = f.audioTracks || "";
-        if (skNorm && !sameTitles) {
-            // SK: match exact diacritics first, then normalized
-            if ((fnLower.includes(skExact) || fnNorm.includes(skNorm)) && !audio.includes("SK")) {
-                audio = audio ? audio + " SK" : "SK";
-            }
-        }
-        if (czNorm) {
-            if ((fnLower.includes(czExact) || fnNorm.includes(czNorm)) && !audio.includes("CZ")) {
-                audio = audio ? audio + " CZ" : "CZ";
-            }
-        }
-        f.audioTracks = audio.trim();
-    }
+function enhanceAudioByTitle() {
+    // Audio flags come only from explicit language labels, never translated titles.
 }
 
 function makeEpFilter(epTag, season, episode) {
     if (!epTag) return null;
-    const ss = String(season).padStart(2, "0"), ee = String(episode).padStart(2, "0");
-    const variants = [
-        epTag.toLowerCase(),      // s01e02
-        `${season}x${ee}`,        // 1x02
-        `${ss}x${ee}`,            // 01x02
-        `s${ss} e${ee}`,          // s01 e02
-        `s${season}e${episode}`,  // s1e2
-    ];
     return (name) => {
-        const lower = name.toLowerCase();
-        return variants.some(v => lower.includes(v));
+        const tags = String(name || "").matchAll(/(?:^|[^a-z0-9])(?:s(\d+)\s*[._ -]*e(\d+)|(\d+)x(\d+))(?!\d)/gi);
+        return [...tags].some(m => Number(m[1] ?? m[3]) === season && Number(m[2] ?? m[4]) === episode);
     };
 }
 
 async function searchStForImdb(imdbId, season, episode) {
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
-    const seen = new Set(), all = [];
-    const perQuery = await Promise.all(queries.map(q => fetchVideos(q)));
-    for (const r of perQuery) {
-        for (const item of r) { if (!seen.has(item.id)) { seen.add(item.id); all.push(item); } }
-    }
+    const all = await searchQueryVariants("st", queries, fetchVideos, item => item.id);
     const matchesEp = makeEpFilter(epTag, season, episode);
     return matchesEp ? all.filter(i => matchesEp(i.name || i.title || "")) : all;
 }
@@ -646,11 +705,7 @@ async function searchFsForImdb(imdbId, season, episode) {
     if (!fsLoggedIn) return [];
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
-    const seen = new Set(), all = [];
-    const perQuery = await Promise.all(queries.map(q => fsSearch(q)));
-    for (const r of perQuery) {
-        for (const f of r) { if (!seen.has(f.fsId)) { seen.add(f.fsId); all.push(f); } }
-    }
+    const all = await searchQueryVariants("fs", queries, fsSearch, file => file.fsId);
     const matchesEp = makeEpFilter(epTag, season, episode);
     return matchesEp ? all.filter(f => matchesEp(f.name)) : all;
 }
@@ -658,11 +713,7 @@ async function searchFsForImdb(imdbId, season, episode) {
 async function searchHsForImdb(imdbId, season, episode) {
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
-    const seen = new Set(), all = [];
-    const perQuery = await Promise.all(queries.map(q => hsSearch(q)));
-    for (const r of perQuery) {
-        for (const f of r) { if (!seen.has(f.hsId)) { seen.add(f.hsId); all.push(f); } }
-    }
+    const all = await searchQueryVariants("hs", queries, hsSearch, file => file.hsId);
     const matchesEp = makeEpFilter(epTag, season, episode);
     return matchesEp ? all.filter(f => matchesEp(f.name)) : all;
 }
@@ -671,11 +722,7 @@ async function searchWsForImdb(imdbId, season, episode) {
     if (!wsLoggedIn) return [];
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
-    const seen = new Set(), all = [];
-    const perQuery = await Promise.all(queries.map(q => wsSearch(q)));
-    for (const r of perQuery) {
-        for (const f of r) { if (!seen.has(f.wsId)) { seen.add(f.wsId); all.push(f); } }
-    }
+    const all = await searchQueryVariants("ws", queries, wsSearch, file => file.wsId);
     const matchesEp = makeEpFilter(epTag, season, episode);
     return matchesEp ? all.filter(f => matchesEp(f.name)) : all;
 }
@@ -689,9 +736,9 @@ let wsToken = "";
 let wsLoggedIn = false;
 let wsVip = false;
 let wsUser = "";
-const wsFileCache = lruCache(1000);
+const wsFileCache = lruCache(1000, "wsFileCache");
 
-async function wsLogin(username, password) {
+async function wsLoginRaw(username, password) {
     try {
         // 1. Get salt
         const saltResp = await axios.post("https://webshare.cz/api/salt/", `username_or_email=${encodeURIComponent(username)}`, {
@@ -811,9 +858,9 @@ function wsFormatDesc(f) {
 let ptCookie = "";
 let ptLoggedIn = false;
 let ptUser = "";
-const ptFileCache = lruCache(1000);
+const ptFileCache = lruCache(1000, "ptFileCache");
 
-async function ptLogin(email, password) {
+async function ptLoginRaw(email, password) {
     try {
         // Get initial cookies from homepage
         const pageResp = await axios.get("https://prehraj.to/", {
@@ -922,6 +969,11 @@ async function ptSearch(query) {
     } catch (e) { console.error("[PREHRAJ.TO] Search error:", e.message); return []; }
 }
 
+function isVideoRedirect(target) {
+    if (!/^https?:$/.test(target.protocol)) return false;
+    return /\.(mp4|mkv|webm|avi|m3u8)(?:$|[/?])/i.test(target.pathname) ||
+        /(^|\.)premiumcdn\.net$/i.test(target.hostname);
+}
 async function ptGetStreamUrl(ptSlug, ptId) {
     try {
         // 1. Fetch the video page to get cookies
@@ -939,6 +991,7 @@ async function ptGetStreamUrl(ptSlug, ptId) {
         if (pageCookies.length) cookies = mergeCookies(cookies, pageCookies);
 
         // 2. Use ?do=download to get the original file URL (all audio tracks)
+        try {
         const dlResp = await axios.get(`${pageUrl}?do=download`, {
             headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
@@ -948,9 +1001,10 @@ async function ptGetStreamUrl(ptSlug, ptId) {
             maxRedirects: 0, validateStatus: () => true, timeout: 15000,
         });
         if (dlResp.status >= 300 && dlResp.status < 400 && dlResp.headers.location) {
-            console.log(`[PREHRAJ.TO] Download URL for ${ptId}: original file`);
-            return dlResp.headers.location;
+            const target = new URL(dlResp.headers.location, pageUrl);
+            if (isVideoRedirect(target)) return target.href;
         }
+        } catch (e) { console.log("[PREHRAJ.TO] Original unavailable, trying page stream"); }
 
         // 3. Fallback: extract stream URL from page (transcoded, single audio track)
         const html = typeof pageResp.data === "string" ? pageResp.data : "";
@@ -965,11 +1019,7 @@ async function ptGetStreamUrl(ptSlug, ptId) {
 async function searchPtForImdb(imdbId, season, episode) {
     const { queries, epTag } = await buildImdbQueries(imdbId, season, episode);
     if (!queries.length) return [];
-    const seen = new Set(), all = [];
-    const perQuery = await Promise.all(queries.map(q => ptSearch(q)));
-    for (const r of perQuery) {
-        for (const f of r) { if (!seen.has(f.ptId)) { seen.add(f.ptId); all.push(f); } }
-    }
+    const all = await searchQueryVariants("pt", queries, ptSearch, file => file.ptId);
     const matchesEp = makeEpFilter(epTag, season, episode);
     return matchesEp ? all.filter(f => matchesEp(f.name)) : all;
 }
@@ -997,6 +1047,59 @@ function stLabel() { return `SledujTeTo.cz ${stPremium ? "✓" : "✗"}`; }
 function fsLabel() { return `Fastshare.cz ${fsUnlimited ? "✓" : "✗"}`; }
 function wsLabel() { return `Webshare.cz ${wsVip ? "✓" : "✗"}`; }
 
+// Administrative access is local by default; remote browsers pair with a code.
+if (!config.adminToken) { config.adminToken = crypto.randomBytes(24).toString("hex"); saveConfig(config); }
+function localAdmin(req) {
+    const peer = req.socket.remoteAddress;
+    const host = (req.headers.host || "").split(":")[0];
+    return ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(peer) && ["127.0.0.1", "localhost"].includes(host);
+}
+function sameOrigin(req) {
+    if (req.headers["sec-fetch-site"] === "cross-site") return false;
+    if (!req.headers.origin) return true;
+    try { return new URL(req.headers.origin).host === req.headers.host; } catch (_) { return false; }
+}
+function hasAdminAccess(req) {
+    if (!sameOrigin(req)) return false;
+    if (localAdmin(req)) return true;
+    const cookies = Object.fromEntries((req.headers.cookie || "").split(";").map(v => v.trim().split("=")));
+    const token = req.headers.authorization?.replace(/^Bearer /, "") || cookies.streamhub_admin;
+    return typeof token === "string" && /^[a-f0-9]{48}$/.test(token) &&
+        crypto.timingSafeEqual(Buffer.from(token), Buffer.from(config.adminToken));
+}
+function pairingHTML() {
+    return `<!doctype html><html lang="sk"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Stream Hub – prístup</title><body style="background:#111827;color:white;font-family:sans-serif;padding:24px">
+    <h1>Správa Stream Hubu</h1><p>Zadaj kód z menu aplikácie na zariadení, kde beží server.</p>
+    <form id="pair"><input id="code" type="password" autocomplete="off" aria-label="Kód prístupu"><button>Pripojiť</button></form><p id="error"></p>
+    <script>document.getElementById('pair').onsubmit=async e=>{e.preventDefault();try{const r=await fetch('/api/admin/pair',{method:'POST',body:JSON.stringify({token:document.getElementById('code').value.trim()})});if(r.ok)location.reload();else document.getElementById('error').textContent='Nesprávny kód';}catch(e){document.getElementById('error').textContent='Server nedostupný';}};</script></body></html>`;
+}
+function guardAdmin(req, res) {
+    const pathname = req.url.split("?")[0];
+    const configure = ["/", "", "/configure", "/configure/"].includes(pathname);
+    if (!pathname.startsWith("/api/") && !configure) return false;
+    res.setHeader("Cache-Control", "no-store");
+    if (pathname === "/api/admin/pair" && req.method === "POST") {
+        if (!sameOrigin(req)) { res.writeHead(403); res.end(); return true; }
+        let body = "";
+        req.on("data", c => { body += c; if (body.length > 4096) req.destroy(); });
+        req.on("end", () => {
+            try {
+                const { token } = JSON.parse(body);
+                if (typeof token !== "string" || !/^[a-f0-9]{48}$/.test(token) ||
+                    !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(config.adminToken))) throw new Error();
+                res.setHeader("Set-Cookie", "streamhub_admin=" + config.adminToken + "; HttpOnly; SameSite=Strict; Path=/");
+                res.writeHead(200); res.end("OK");
+            } catch (_) { res.writeHead(403); res.end("Forbidden"); }
+        });
+        return true;
+    }
+    if (hasAdminAccess(req)) return false;
+    res.writeHead(configure ? 200 : 403, { "Content-Type": configure ? "text/html; charset=utf-8" : "application/json" });
+    res.end(configure ? pairingHTML() : JSON.stringify({ error: "Admin access required" }));
+    return true;
+}
+
 // ============ LAN MODE ============
 
 // LAN mode (config.lanMode): when enabled the servers listen on 0.0.0.0, so
@@ -1006,6 +1109,10 @@ let addonServer = null;
 
 function currentBindHost() { return config.lanMode ? "0.0.0.0" : "127.0.0.1"; }
 
+function getLanHost() {
+    const ips = getLanIps();
+    return config.lanMode ? (ips.includes(config.lanHost) ? config.lanHost : ips[0] || "127.0.0.1") : "127.0.0.1";
+}
 function getLanIps() {
     const ips = [];
     for (const list of Object.values(os.networkInterfaces())) {
@@ -1080,7 +1187,13 @@ async function stremioInstalledKeys(authKey, host) {
 
 // Push selected Stream Hub addons (LAN URLs) into the account, replacing any
 // previous Stream Hub entries so re-installing doesn't create duplicates.
-async function stremioInstall(authKey, host, keys) {
+let accountWrite = Promise.resolve();
+function stremioInstall(authKey, host, keys) {
+    const job = accountWrite.then(() => stremioInstallRaw(authKey, host, keys));
+    accountWrite = job.catch(() => {});
+    return job;
+}
+async function stremioInstallRaw(authKey, host, keys) {
     let addons = await stremioGetAddons(authKey);
     // Only remove the addons we're about to (re)install, so adding one addon
     // does not wipe the others already in the account.
@@ -1103,8 +1216,10 @@ async function stremioInstall(authKey, host, keys) {
 
 // ============ PROXY ============
 
+const activeTransfers = new Set();
 function startProxyServer() {
     const proxy = http.createServer(async (req, res) => {
+        if (guardAdmin(req, res)) return;
         // "Zastaviť server" in the UI now stops streaming too, not just the addon handlers
         const isStreamReq = /^\/(proxy|fsproxy|ptproxy|wsproxy)\//.test(req.url);
         if (isStreamReq && !serverRunning) { res.writeHead(503); res.end("Server stopped"); return; }
@@ -1140,6 +1255,10 @@ function startProxyServer() {
                 if (vidResp.headers["content-range"]) fwd["Content-Range"] = vidResp.headers["content-range"];
                 if (vidResp.headers["accept-ranges"]) fwd["Accept-Ranges"] = vidResp.headers["accept-ranges"];
                 res.writeHead(vidResp.status, fwd);
+                if (!serverRunning) { vidResp.data.destroy(); res.writeHead(503); res.end("Server stopped"); return; }
+                const transfer = { upstream: vidResp.data, response: res };
+                activeTransfers.add(transfer);
+                res.on("close", () => activeTransfers.delete(transfer));
                 vidResp.data.pipe(res);
                 vidResp.data.on("error", () => res.end());
                 res.on("close", () => vidResp.data.destroy());
@@ -1164,6 +1283,10 @@ function startProxyServer() {
                 if (vidResp.headers["content-range"]) fwd["Content-Range"] = vidResp.headers["content-range"];
                 if (vidResp.headers["accept-ranges"]) fwd["Accept-Ranges"] = vidResp.headers["accept-ranges"];
                 res.writeHead(vidResp.status, fwd);
+                if (!serverRunning) { vidResp.data.destroy(); res.writeHead(503); res.end("Server stopped"); return; }
+                const transfer = { upstream: vidResp.data, response: res };
+                activeTransfers.add(transfer);
+                res.on("close", () => activeTransfers.delete(transfer));
                 vidResp.data.pipe(res);
                 vidResp.data.on("error", () => res.end());
                 res.on("close", () => vidResp.data.destroy());
@@ -1190,6 +1313,10 @@ function startProxyServer() {
                 if (vidResp.headers["content-range"]) fwd["Content-Range"] = vidResp.headers["content-range"];
                 if (vidResp.headers["accept-ranges"]) fwd["Accept-Ranges"] = vidResp.headers["accept-ranges"];
                 res.writeHead(vidResp.status, fwd);
+                if (!serverRunning) { vidResp.data.destroy(); res.writeHead(503); res.end("Server stopped"); return; }
+                const transfer = { upstream: vidResp.data, response: res };
+                activeTransfers.add(transfer);
+                res.on("close", () => activeTransfers.delete(transfer));
                 vidResp.data.pipe(res);
                 vidResp.data.on("error", () => res.end());
                 res.on("close", () => vidResp.data.destroy());
@@ -1203,6 +1330,7 @@ function startProxyServer() {
                 serverRunning,
                 lanMode: !!config.lanMode,
                 lanIps: getLanIps(),
+                lanHost: getLanHost(),
                 stremio: { loggedIn: !!config.stremioAuthKey, user: config.stremioUser || "" },
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
                 fs: { loggedIn: fsLoggedIn, unlimited: fsUnlimited, user: fsUser },
@@ -1227,7 +1355,9 @@ function startProxyServer() {
             req.on("data", c => body += c);
             req.on("end", () => {
                 try {
-                    const { enabled } = JSON.parse(body);
+                    const { enabled, host } = JSON.parse(body);
+                    if (host && !getLanIps().includes(host)) throw new Error("Invalid LAN address");
+                    if (host) config.lanHost = host;
                     config.lanMode = !!enabled;
                     saveConfig(config);
                     console.log(`[LAN] Mode ${config.lanMode ? "ENABLED (0.0.0.0)" : "disabled (127.0.0.1)"}`);
@@ -1283,7 +1413,7 @@ function startProxyServer() {
                 if (/[?&]fresh=1/.test(req.url)) installedCache.ts = 0; // pull-to-refresh forces a live check
                 if (!config.stremioAuthKey) { res.end(JSON.stringify({ ok: true, keys: [] })); return; }
                 const ips = getLanIps();
-                const host = config.lanMode && ips.length ? ips[0] : "127.0.0.1";
+                const host = getLanHost();
                 const keys = await stremioInstalledKeys(config.stremioAuthKey, host);
                 res.end(JSON.stringify({ ok: true, keys }));
             } catch (e) {
@@ -1303,7 +1433,7 @@ function startProxyServer() {
                     const keys = (parsed.keys && parsed.keys.length) ? parsed.keys : ["st", "fs", "hs", "ws", "pt"];
                     // Use the LAN IP so remote devices (phone, TV) can reach the server.
                     const ips = getLanIps();
-                    const host = config.lanMode && ips.length ? ips[0] : "127.0.0.1";
+                    const host = getLanHost();
                     const count = await stremioInstall(config.stremioAuthKey, host, keys);
                     console.log(`[STREMIO] Installed ${count} addons into account (host ${host})`);
                     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -1365,7 +1495,9 @@ function startProxyServer() {
                     res.end(JSON.stringify({ ok: false, error: "update.json neobsahuje addonUrl" }));
                     return;
                 }
-                const dl = await axios.get(m.addonUrl, {
+                const source = new URL(m.addonUrl);
+                if (source.protocol !== "https:" || source.hostname !== "raw.githubusercontent.com" || !source.pathname.startsWith("/lerrel129/stream-hub-updates/")) throw new Error("Untrusted update URL");
+                const dl = await axios.get(source.href, {
                     timeout: 30000, responseType: "text", validateStatus: () => true,
                     headers: { "Cache-Control": "no-cache" },
                 });
@@ -1377,9 +1509,13 @@ function startProxyServer() {
                     res.end(JSON.stringify({ ok: false, error: "Stiahnutý súbor nie je platný addon.js" }));
                     return;
                 }
-                // Back up the original file + write the new one
-                try { fs.writeFileSync(__filename + ".bak", fs.readFileSync(__filename)); } catch (e) {}
-                fs.writeFileSync(__filename, newCode, "utf8");
+                new vm.Script(require("module").wrap(newCode), { filename: "addon-update.js" });
+                const downloadedVersion = newCode.match(/const APP_VERSION = (\d+);/);
+                if (!downloadedVersion || Number(downloadedVersion[1]) !== latest) throw new Error("Update version mismatch");
+                if (m.sha256 && crypto.createHash("sha256").update(newCode).digest("hex") !== m.sha256) throw new Error("Update checksum mismatch");
+                fs.writeFileSync(__filename + ".next", newCode, "utf8");
+                fs.copyFileSync(__filename, __filename + ".bak");
+                fs.renameSync(__filename + ".next", __filename);
                 console.log(`[UPDATE] Nainštalovaná verzia ${latest}, reštartujem...`);
                 res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                 res.end(JSON.stringify({ ok: true, version: latest }));
@@ -1414,6 +1550,7 @@ function startProxyServer() {
         }
 
         if (req.url === "/api/logout/st" && req.method === "POST") {
+            invalidateSession("st");
             sessionCookie = ""; loggedIn = false; stPremium = false;
             delete config.stEmail; delete config.stPassword; saveConfig(config);
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -1442,6 +1579,7 @@ function startProxyServer() {
         }
 
         if (req.url === "/api/logout/fs" && req.method === "POST") {
+            invalidateSession("fs");
             fsCookie = ""; fsLoggedIn = false; fsUnlimited = false; fsUser = "";
             delete config.fsUsername; delete config.fsPassword; saveConfig(config);
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -1470,6 +1608,7 @@ function startProxyServer() {
         }
 
         if (req.url === "/api/logout/ws" && req.method === "POST") {
+            invalidateSession("ws");
             wsToken = ""; wsLoggedIn = false; wsVip = false; wsUser = "";
             delete config.wsUsername; delete config.wsPassword; saveConfig(config);
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -1498,6 +1637,7 @@ function startProxyServer() {
         }
 
         if (req.url === "/api/logout/pt" && req.method === "POST") {
+            invalidateSession("pt");
             ptCookie = ""; ptLoggedIn = false; ptUser = "";
             delete config.ptEmail; delete config.ptPassword; saveConfig(config);
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -1507,6 +1647,8 @@ function startProxyServer() {
 
         if (req.url === "/api/server/stop" && req.method === "POST") {
             serverRunning = false;
+            for (const t of activeTransfers) { t.upstream.destroy(); t.response.destroy(); }
+            activeTransfers.clear();
             console.log("[SERVER] Stopped by user");
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
             res.end(JSON.stringify({ ok: true, running: false }));
@@ -1585,6 +1727,9 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
 .update-btn { padding: 8px 16px; border: none; border-radius: 12px; font-size: 12px; cursor: pointer; font-weight: bold; color: #fff; background: #4a9c4f; transition: background 0.15s; flex-shrink: 0; }
 .update-btn:hover { background: #3d8b40; }
 .update-btn:disabled { opacity: 0.5; cursor: default; }
+#lanSettings { flex-wrap: wrap; }
+#lanSettings .update-info { flex: 1; }
+#lanHostSelect { width: 100%; padding: 8px; background: #111827; color: #fff; border: 1px solid #374151; border-radius: 8px; }
 
 /* Login panel */
 .login-panel { background: #1a2233; border-radius: 16px; padding: 16px; margin-bottom: 12px; animation: slideDown 0.2s ease-out; display: none; }
@@ -1784,14 +1929,16 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
         <button class="update-btn" id="updBtn" onclick="updateAction()">Skontrolovať</button>
     </div>
 
-    <div class="update-bar">
+    <div class="update-bar" id="lanSettings">
         <div class="update-info">
             <span class="update-title" id="lanTitle">Prístup zo siete</span>
             <span class="update-status" id="lanStatus">...</span>
         </div>
         <button class="update-btn" id="lanBtn" onclick="lanToggle()">...</button>
+        <select id="lanHostSelect" aria-label="LAN IP" onchange="saveLanHost(this.value)"></select>
     </div>
 
+    <details style="margin:12px 0"><summary>Kód pre správu zo siete</summary><code style="overflow-wrap:anywhere">${config.adminToken}</code></details>
     <div class="login-panel open" id="stremioBox" style="animation:none;">
         <div class="panel-title" id="stremioTitle">Inštalovať do Stremio účtu</div>
         <input type="text" id="stremioEmail" placeholder="Stremio email">
@@ -2019,6 +2166,10 @@ function updateAddButtons() {
     });
 }
 
+async function saveLanHost(host) {
+    await fetch(API + "/api/lan", { method: "POST", body: JSON.stringify({ enabled: lanMode, host }) });
+    await loadStatus();
+}
 async function lanToggle() {
     const btn = document.getElementById("lanBtn");
     btn.disabled = true;
@@ -2029,7 +2180,7 @@ async function lanToggle() {
 // ---- Stremio account install ----
 async function stremioLoginAction() {
     const email = document.getElementById("stremioEmail").value.trim();
-    const pw = document.getElementById("stremioPassword").value.trim();
+    const pw = document.getElementById("stremioPassword").value;
     const authKey = document.getElementById("stremioAuthKey").value.trim();
     if (!authKey && (!email || !pw)) return alert(t("strFillLogin"));
     const spin = document.getElementById("stremioSpinner");
@@ -2112,6 +2263,8 @@ async function loadStatus(force) {
         // LAN + Stremio account
         lanMode = !!s.lanMode;
         lanIps = s.lanIps || [];
+        const hostSelect = document.getElementById("lanHostSelect");
+        hostSelect.replaceChildren(...lanIps.map(ip => { const option = document.createElement("option"); option.value = ip; option.textContent = ip; option.selected = ip === s.lanHost; return option; }));
         renderLanUI();
         stremioLoggedIn = !!(s.stremio && s.stremio.loggedIn);
         const strMsg = document.getElementById("stremioMsg");
@@ -2139,7 +2292,7 @@ async function loadStatus(force) {
         let runLabel = t("serverStopped");
         if (running) {
             const inNet = lanMode && lanIps.length;
-            const ip = inNet ? lanIps[0] : "127.0.0.1";
+            const ip = inNet ? s.lanHost : "127.0.0.1";
             runLabel = t("serverRunning") + " – " + ip + " (" + (inNet ? t("netAll") : t("netLocal")) + ")";
         }
         document.getElementById("serverLabel").textContent = runLabel;
@@ -2152,7 +2305,7 @@ async function loadStatus(force) {
         if (s.st.loggedIn) {
             stStatus.innerHTML = '✓ ' + s.st.user; stStatus.style.color = "#34d399";
             stBadge.textContent = s.st.premium ? "✓" : "💲"; stBadge.style.color = s.st.premium ? "#4a9c4f" : "#fbbf24";
-            document.getElementById("stEmail").value = s.st.user;
+            if (document.activeElement !== document.getElementById("stEmail")) document.getElementById("stEmail").value = s.st.user;
             document.getElementById("stLogoutBtn").classList.remove("hidden");
         } else {
             stStatus.textContent = t("notLoggedIn"); stStatus.style.color = "#6b7280";
@@ -2166,7 +2319,7 @@ async function loadStatus(force) {
         if (s.fs.loggedIn) {
             fsStatus.innerHTML = '✓ ' + s.fs.user; fsStatus.style.color = "#34d399";
             fsBadge.textContent = s.fs.unlimited ? "✓" : "💲"; fsBadge.style.color = s.fs.unlimited ? "#4a9c4f" : "#fbbf24";
-            document.getElementById("fsUsername").value = s.fs.user;
+            if (document.activeElement !== document.getElementById("fsUsername")) document.getElementById("fsUsername").value = s.fs.user;
             document.getElementById("fsLogoutBtn").classList.remove("hidden");
         } else {
             fsStatus.textContent = t("notLoggedIn"); fsStatus.style.color = "#6b7280";
@@ -2180,7 +2333,7 @@ async function loadStatus(force) {
         if (s.ws.loggedIn) {
             wsStatus.innerHTML = '✓ ' + s.ws.user; wsStatus.style.color = "#34d399";
             wsBadge.textContent = s.ws.vip ? "✓" : "💲"; wsBadge.style.color = s.ws.vip ? "#4a9c4f" : "#fbbf24";
-            document.getElementById("wsUsername").value = s.ws.user;
+            if (document.activeElement !== document.getElementById("wsUsername")) document.getElementById("wsUsername").value = s.ws.user;
             document.getElementById("wsLogoutBtn").classList.remove("hidden");
         } else {
             wsStatus.textContent = t("notLoggedIn"); wsStatus.style.color = "#6b7280";
@@ -2194,7 +2347,7 @@ async function loadStatus(force) {
         if (s.pt.loggedIn) {
             ptStatus.innerHTML = '✓ ' + s.pt.user; ptStatus.style.color = "#34d399";
             ptBadge.textContent = "✓"; ptBadge.style.color = "#4a9c4f";
-            document.getElementById("ptEmail").value = s.pt.user;
+            if (document.activeElement !== document.getElementById("ptEmail")) document.getElementById("ptEmail").value = s.pt.user;
             document.getElementById("ptLogoutBtn").classList.remove("hidden");
         } else {
             ptStatus.textContent = t("loginRequired"); ptStatus.style.color = "#f87171";
@@ -2211,7 +2364,7 @@ async function loadStatus(force) {
 
 async function stLogin() {
     const email = document.getElementById("stEmail").value.trim();
-    const pw = document.getElementById("stPassword").value.trim();
+    const pw = document.getElementById("stPassword").value;
     if (!email || !pw) return alert(t("fillEmailPassword"));
     document.getElementById("stSpinner").classList.remove("hidden");
     document.getElementById("stLoginBtn").disabled = true;
@@ -2228,7 +2381,7 @@ async function stLogout() { await fetch(API + "/api/logout/st", { method: "POST"
 
 async function fsLoginAction() {
     const user = document.getElementById("fsUsername").value.trim();
-    const pw = document.getElementById("fsPassword").value.trim();
+    const pw = document.getElementById("fsPassword").value;
     if (!user || !pw) return alert(t("fillUsernamePassword"));
     document.getElementById("fsSpinner").classList.remove("hidden");
     document.getElementById("fsLoginBtn").disabled = true;
@@ -2245,7 +2398,7 @@ async function fsLogout() { await fetch(API + "/api/logout/fs", { method: "POST"
 
 async function wsLoginAction() {
     const user = document.getElementById("wsUsername").value.trim();
-    const pw = document.getElementById("wsPassword").value.trim();
+    const pw = document.getElementById("wsPassword").value;
     if (!user || !pw) return alert(t("fillUsernamePassword"));
     document.getElementById("wsSpinner").classList.remove("hidden");
     document.getElementById("wsLoginBtn").disabled = true;
@@ -2262,7 +2415,7 @@ async function wsLogoutAction() { await fetch(API + "/api/logout/ws", { method: 
 
 async function ptLoginAction() {
     const email = document.getElementById("ptEmail").value.trim();
-    const pw = document.getElementById("ptPassword").value.trim();
+    const pw = document.getElementById("ptPassword").value;
     if (!email || !pw) return alert(t("fillEmailPassword"));
     document.getElementById("ptSpinner").classList.remove("hidden");
     document.getElementById("ptLoginBtn").disabled = true;
@@ -2281,9 +2434,10 @@ async function toggleServer() {
     const btn = document.getElementById("serverToggle");
     const isRunning = btn.textContent === t("stop");
     btn.disabled = true;
-    await fetch(API + "/api/server/" + (isRunning ? "stop" : "start"), { method: "POST" });
-    await loadStatus();
-    btn.disabled = false;
+    try {
+        await fetch(API + "/api/server/" + (isRunning ? "stop" : "start"), { method: "POST" });
+        await loadStatus();
+    } finally { btn.disabled = false; }
 }
 
 function installOne(key) {
@@ -2292,9 +2446,8 @@ function installOne(key) {
     // Otherwise the normal local install: copy URL + open the stremio:// link.
     const url = addonUrls[key];
     if (!url) return;
-    navigator.clipboard.writeText(url).then(() => {
-        window.open("stremio://" + url.replace(/^https?:\\/\\//, ""), "_blank");
-    });
+    if (navigator.clipboard) navigator.clipboard.writeText(url).catch(() => {});
+    window.open("stremio://" + url.replace(/^https?:\\/\\//, ""), "_blank");
 }
 
 // ---- Update ----
@@ -2370,7 +2523,7 @@ function renderUpdateUI() {
 
     // Version shown to the user - the version NAME (e.g. "1.3"), not the
     // internal counter. Falls back to the addon.js version if unknown.
-    const shownVer = NATIVE_VER_NAME ? ("v" + NATIVE_VER_NAME) : ("v" + APP_VER);
+    const shownVer = NATIVE_VER_NAME ? ("v" + NATIVE_VER_NAME) : "v${RELEASE_VERSION}";
 
     if (!d) {
         st.textContent = shownVer;
@@ -2463,7 +2616,7 @@ function parseImdbId(id) {
 // --- SledujTeTo addon ---
 const stManifest = {
     id: "cz.sledujteto.stremio",
-    version: "2.4.0",
+    version: RELEASE_VERSION,
     name: "SledujTeTo.cz",
     description: "SledujTeTo.cz pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -2496,27 +2649,14 @@ stBuilder.defineStreamHandler(async ({ type, id }) => {
     if (id.startsWith("sleduj:")) {
         const vid = id.replace("sleduj:", "");
         const info = await getStreamInfo(vid);
-        if (info) {
-            const fd = fileDataCache[vid];
-            const name = fd?.name || "";
-            return { streams: [{ url: `http://127.0.0.1:${PROXY_PORT}/proxy/${vid}`, name: `${stLabel()}\n${stFormatName(name, fd)}`, description: stFormatDesc(name, fd), behaviorHints: { notWebReady: true } }] };
-        }
+        if (info) return { streams: [makeStStream(vid)] };
         return { streams: [{ externalUrl: urlCache[vid] || `${BASE_URL}/file/${vid}/`, title: "Otvoriť v prehliadači", name: stLabel() }] };
     }
     if (id.startsWith("tt")) {
         const { imdbId, season, episode } = parseImdbId(id);
-        // Cap + parallel resolve - serial resolution of every result used to
-        // risk Stremio timeouts on titles with many hits.
+        // Resolve the final playback URL only after a stream is selected.
         const results = (await searchStForImdb(imdbId, season, episode)).slice(0, 30);
-        const resolved = await Promise.all(results.map(async item => {
-            const vid = item.id.replace("sleduj:", "");
-            const info = await getStreamInfo(vid);
-            if (!info) return null;
-            const fd = fileDataCache[vid];
-            const name = fd?.name || "";
-            return { url: `http://127.0.0.1:${PROXY_PORT}/proxy/${vid}`, name: `${stLabel()}\n${stFormatName(name, fd, imdbId)}`, description: stFormatDesc(name, fd), behaviorHints: { notWebReady: true } };
-        }));
-        const streams = resolved.filter(Boolean);
+        const streams = results.map(item => makeStStream(item.id.replace("sleduj:", ""), imdbId));
         console.log(`[STREAM] ST ${id}: ${streams.length} streams`);
         return { streams };
     }
@@ -2526,7 +2666,7 @@ stBuilder.defineStreamHandler(async ({ type, id }) => {
 // --- Fastshare addon ---
 const fsManifest = {
     id: "cz.fastshare.stremio",
-    version: "2.4.0",
+    version: RELEASE_VERSION,
     name: "Fastshare.cz",
     description: "Fastshare.cz pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -2577,7 +2717,7 @@ fsBuilder.defineStreamHandler(async ({ type, id }) => {
 // --- Hellspy addon ---
 const hsManifest = {
     id: "cz.hellspy.stremio",
-    version: "2.4.0",
+    version: RELEASE_VERSION,
     name: "Hellspy.to",
     description: "Hellspy.to pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -2628,7 +2768,7 @@ hsBuilder.defineStreamHandler(async ({ type, id }) => {
 // --- Webshare addon ---
 const wsManifest = {
     id: "cz.webshare.stremio",
-    version: "2.4.0",
+    version: RELEASE_VERSION,
     name: "Webshare.cz",
     description: "Webshare.cz pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -2682,7 +2822,7 @@ wsBuilder.defineStreamHandler(async ({ type, id }) => {
 // --- PrehrajTo addon ---
 const ptManifest = {
     id: "cz.prehrajto.stremio",
-    version: "2.4.0",
+    version: RELEASE_VERSION,
     name: "Prehraj.to",
     description: "Prehraj.to pre Stremio",
     resources: ["catalog", "meta", "stream"],
@@ -2741,6 +2881,7 @@ const addonInterfaces = {
 
 function startAddonServer() {
     const server = http.createServer(async (req, res) => {
+        if (guardAdmin(req, res)) return;
         res.setHeader("Access-Control-Allow-Origin", "*");
         res.setHeader("Access-Control-Allow-Headers", "*");
         if (req.method === "OPTIONS") { res.writeHead(200); res.end(); return; }
@@ -2766,7 +2907,7 @@ function startAddonServer() {
                     req.on("end", async () => {
                         try {
                             const proxyResp = await axios.post(proxyUrl, body, {
-                                headers: { "Content-Type": req.headers["content-type"] || "application/json" },
+                                headers: { "Content-Type": req.headers["content-type"] || "application/json", Host: req.headers.host, Cookie: req.headers.cookie || "", Authorization: "Bearer " + config.adminToken },
                                 timeout: 30000, validateStatus: () => true,
                             });
                             res.writeHead(proxyResp.status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -2777,7 +2918,7 @@ function startAddonServer() {
                         }
                     });
                 } else {
-                    const proxyResp = await axios.get(proxyUrl, { timeout: 30000, validateStatus: () => true });
+                    const proxyResp = await axios.get(proxyUrl, { headers: { Host: req.headers.host, Authorization: "Bearer " + config.adminToken }, timeout: 30000, validateStatus: () => true });
                     res.writeHead(proxyResp.status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                     res.end(rewriteLocalUrls(typeof proxyResp.data === "string" ? proxyResp.data : JSON.stringify(proxyResp.data), req));
                 }
@@ -2826,12 +2967,8 @@ function startAddonServer() {
         const match3 = subPath.match(/^\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+?)\.json$/);
         if (match3) {
             const [, resource, type, id, extraStr] = match3;
-            const extra = {};
-            for (const part of decodeURIComponent(extraStr).split("&")) {
-                const eq = part.indexOf("=");
-                if (eq > 0) extra[part.substring(0, eq)] = part.substring(eq + 1);
-            }
             try {
+                const extra = Object.fromEntries(new URLSearchParams(extraStr));
                 const result = await iface.get(resource, type, decodeURIComponent(id), extra);
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(rewriteLocalUrls(JSON.stringify(result), req));
@@ -2905,4 +3042,4 @@ async function start() {
     console.log(`========================================`);
 }
 
-start();
+if (require.main === module) start();
