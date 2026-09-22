@@ -106,6 +106,14 @@ check('Generated configuration JavaScript parses and passwords are not trimmed',
     assert.ok(!/Password"\)\.value\.trim/.test(script));
     assert.ok(html.includes('lanHostSelect'));new vm.Script(f.run('pairingHTML()').match(/<script>([\s\S]*?)<\/script>/)[1]);
 });
+check('Android install uses an HTTPS manifest without writing to the Stremio account',f=>{
+    const html=f.run('getConfigHTML()');
+    const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
+    const install=script.match(/async function installOne\(key\) \{[\s\S]*?\n\}/)[0];
+    assert.ok(install.includes('/api/install-url?key='));
+    assert.ok(!install.includes('accountInstall'));
+    assert.ok(f.run('typeof ensureInstallTunnel'), 'function');
+});
 check('OTA rejects invalid syntax without replacing the installed addon',async f=>{
     fs.writeFileSync(path.join(f.dir,'addon.js'),'original');
     f.run('startProxyServer()');

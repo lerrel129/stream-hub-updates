@@ -6,6 +6,9 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const dns = require("dns");
+const https = require("https");
+const { spawn } = require("child_process");
 
 const BASE_URL = "https://www.sledujteto.cz";
 const API_URL = `${BASE_URL}/api/web`;
@@ -44,6 +47,7 @@ const NATIVE_VERSION = parseInt(process.argv[2]) || 0;
 // Version NAME shown to the user (e.g. "1.3"). The wrapper passes it as
 // process.argv[3] - Android: versionName, PC: the desktop app version.
 const NATIVE_VERSION_NAME = process.argv[3] || "";
+const CLOUDFLARED_BIN = process.argv[4] || process.env.STREAMHUB_CLOUDFLARED || "";
 
 // ============ CONFIG ============
 
@@ -1214,6 +1218,112 @@ async function stremioInstallRaw(authKey, host, keys) {
     return keys.length;
 }
 
+// ============ ANDROID INSTALL TUNNEL ============
+// Stremio's Android UI refuses to fetch local HTTP manifests. This temporary
+// HTTPS origin is used only for opening the manifest, never for account writes.
+let installTunnelUrl = "";
+let installTunnelProcess = null;
+let installTunnelStart = null;
+
+const INSTALL_TUNNEL_EDGES = [
+    "198.41.192.7", "198.41.192.47", "198.41.192.107", "198.41.192.227",
+    "198.41.200.13", "198.41.200.53", "198.41.200.113", "198.41.200.193",
+];
+
+function resolve4(host) {
+    return new Promise(resolve => {
+        const timer = setTimeout(() => resolve([]), 4000);
+        dns.resolve4(host, (error, addresses) => {
+            clearTimeout(timer);
+            resolve(!error && addresses ? addresses : []);
+        });
+    });
+}
+
+async function resolveTunnelEdges() {
+    let addresses = [];
+    for (const host of ["region1.v2.argotunnel.com", "region2.v2.argotunnel.com"]) {
+        addresses.push(...(await resolve4(host)).slice(0, 2));
+    }
+    if (!addresses.length) addresses = INSTALL_TUNNEL_EDGES;
+    return [...new Set(addresses)].slice(0, 8).map(address => `${address}:7844`);
+}
+
+async function waitForInstallManifest(key, timeoutMs = 90000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && installTunnelUrl) {
+        try {
+            const response = await axios.get(`${installTunnelUrl}/${key}/manifest.json`, {
+                timeout: 8000,
+                validateStatus: () => true,
+            });
+            if (response.status === 200) return true;
+        } catch (error) {}
+        await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+    return false;
+}
+
+async function ensureInstallTunnel(key) {
+    if (!CLOUDFLARED_BIN || !fs.existsSync(CLOUDFLARED_BIN)) {
+        throw new Error("HTTPS tunnel is not available on this device");
+    }
+    if (installTunnelUrl && await waitForInstallManifest(key, 12000)) return installTunnelUrl;
+    if (installTunnelStart) {
+        await installTunnelStart;
+        if (await waitForInstallManifest(key, 30000)) return installTunnelUrl;
+        throw new Error("HTTPS tunnel did not become ready");
+    }
+
+    installTunnelStart = (async () => {
+        const registration = await axios.post("https://api.trycloudflare.com/tunnel", "", {
+            headers: { "Content-Type": "application/json" },
+            timeout: 20000,
+            validateStatus: () => true,
+            httpsAgent: new https.Agent({ keepAlive: true }),
+        });
+        const tunnel = registration.data && registration.data.result;
+        if (!tunnel || !tunnel.hostname) throw new Error(`Tunnel registration failed (${registration.status})`);
+
+        const credentials = persistentPath("install-tunnel-credentials.json");
+        const configuration = persistentPath("install-tunnel-config.yml");
+        fs.writeFileSync(credentials, JSON.stringify({
+            AccountTag: tunnel.account_tag,
+            TunnelID: tunnel.id,
+            TunnelSecret: tunnel.secret,
+        }));
+        fs.writeFileSync(configuration,
+            `tunnel: ${tunnel.id}\ncredentials-file: ${credentials}\ningress:\n` +
+            `  - hostname: ${tunnel.hostname}\n    service: http://127.0.0.1:${ADDON_PORT}\n` +
+            "  - service: http_status:404\n");
+
+        const args = ["tunnel", "--config", configuration, "--edge-ip-version", "4", "--no-autoupdate"];
+        for (const edge of await resolveTunnelEdges()) args.push("--edge", edge);
+        args.push("run", tunnel.id);
+        installTunnelProcess = spawn(CLOUDFLARED_BIN, args, { cwd: DATA_DIR });
+        installTunnelProcess.on("error", error => {
+            console.error("[INSTALL TUNNEL] spawn error:", error.message);
+            installTunnelProcess = null;
+            installTunnelUrl = "";
+        });
+        installTunnelProcess.on("exit", code => {
+            console.log("[INSTALL TUNNEL] exited:", code);
+            installTunnelProcess = null;
+            installTunnelUrl = "";
+        });
+        installTunnelUrl = `https://${tunnel.hostname}`;
+        console.log("[INSTALL TUNNEL] URL:", installTunnelUrl);
+        if (!await waitForInstallManifest(key)) throw new Error("HTTPS tunnel did not become ready");
+    })();
+
+    try {
+        await installTunnelStart;
+        return installTunnelUrl;
+    } finally {
+        installTunnelStart = null;
+    }
+}
+
 // ============ PROXY ============
 
 const activeTransfers = new Set();
@@ -1346,6 +1456,22 @@ function startProxyServer() {
             };
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
             res.end(rewriteLocalUrls(JSON.stringify(status), req));
+            return;
+        }
+
+        // Android installation: return a live HTTPS manifest URL without
+        // logging in to Stremio or modifying the user's addon collection.
+        if (req.url.startsWith("/api/install-url")) {
+            res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+            try {
+                const key = new URL(req.url, "http://127.0.0.1").searchParams.get("key");
+                if (!["st", "fs", "hs", "ws", "pt"].includes(key)) throw new Error("Invalid addon");
+                const origin = await ensureInstallTunnel(key);
+                res.end(JSON.stringify({ ok: true, url: `${origin}/${key}/manifest.json` }));
+            } catch (error) {
+                console.error("[INSTALL TUNNEL]", error.message);
+                res.end(JSON.stringify({ ok: false, error: error.message }));
+            }
             return;
         }
 
@@ -2440,14 +2566,26 @@ async function toggleServer() {
     } finally { btn.disabled = false; }
 }
 
-function installOne(key) {
-    // LAN + Stremio account active -> add straight into the account.
-    if (lanMode && stremioLoggedIn) return accountInstall(key);
-    // Otherwise the normal local install: copy URL + open the stremio:// link.
-    const url = addonUrls[key];
-    if (!url) return;
-    if (navigator.clipboard) navigator.clipboard.writeText(url).catch(() => {});
-    window.open("stremio://" + url.replace(/^https?:\\/\\//, ""), "_blank");
+async function installOne(key) {
+    const button = document.querySelector("#card-" + key + " .btn-add");
+    const original = button ? button.textContent : "";
+    if (button) { button.disabled = true; button.textContent = "..."; }
+    try {
+        let url = addonUrls[key];
+        if (isAndroid) {
+            const response = await fetch(API + "/api/install-url?key=" + encodeURIComponent(key));
+            const result = await response.json();
+            if (!result.ok || !result.url) throw new Error(result.error || "HTTPS manifest unavailable");
+            url = result.url;
+        }
+        if (!url) return;
+        if (navigator.clipboard) navigator.clipboard.writeText(url).catch(() => {});
+        window.open("stremio://" + url.replace(/^https?:\\/\\//, ""), "_blank");
+    } catch (error) {
+        alert(t("error") + ": " + error.message);
+    } finally {
+        if (button) { button.disabled = false; button.textContent = original; }
+    }
 }
 
 // ---- Update ----
