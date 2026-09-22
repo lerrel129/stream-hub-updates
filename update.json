@@ -2,7 +2,7 @@
   "version": 37,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/fix/v2.5.1/addon.js",
   "sha256": "d789d36015c23d6d09e7b5b66228bd3adf5bcb68ad4da008437d6171f2af0a6c",
-  "notes": "v2.5.2: rychlejsie a spolahlivejsie vyhladavanie, prehravacie odkazy SledujTeTo sa riesia az pri spusteni, kratkodoba cache vysledkov a trvale nastavenia Windows portable verzie",
-  "apkVersion": 37,
-  "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/download/v2.5.2/stream-hub.apk"
+  "notes": "v2.5.3: Android teraz otvara instalaciu doplnku priamo v aplikacii Stremio namiesto web.stremio.com, cim opravuje chybu Failed to fetch",
+  "apkVersion": 38,
+  "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/download/v2.5.3/stream-hub.apk"
 }
