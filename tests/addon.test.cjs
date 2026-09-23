@@ -95,6 +95,20 @@ check('HTTP catalog routing preserves ampersands and handles malformed encoding'
     assert.equal(JSON.parse(await call('/hs/catalog/movie/hellspy-main/search=Tom%20%26%20Jerry.json')).query,'Tom & Jerry');
     await call('/hs/catalog/movie/hellspy-main/search=bad%.json');
 });
+check('Local servers allow Stremio private-network preflights',async f=>{
+    f.run('startProxyServer();startAddonServer()');
+    const preflight=async server=>{
+        const headers={};let status;
+        const req={url:'/st/manifest.json',method:'OPTIONS',headers:{host:'127.0.0.1:7515',origin:'https://app.strem.io','access-control-request-private-network':'true'},socket:{remoteAddress:'127.0.0.1'}};
+        const res={setHeader(name,value){headers[name.toLowerCase()]=value},writeHead(code){status=code},end(){}};
+        await server.fn(req,res);
+        assert.ok(status===200||status===204);
+        assert.equal(headers['access-control-allow-origin'],'*');
+        assert.equal(headers['access-control-allow-private-network'],'true');
+    };
+    await preflight(f.servers[0]);
+    await preflight(f.servers[1]);
+});
 check('Stop closes existing transfers',async f=>{
     f.context.upstream=new PassThrough(); f.context.response=new PassThrough();
     f.run('activeTransfers.add({upstream,response});startProxyServer()');

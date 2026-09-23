@@ -30,7 +30,7 @@ const CONFIG_PATH = persistentPath("config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 39;
+const APP_VERSION = 40;
 const RELEASE_VERSION = "2.5.2";
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
@@ -1146,6 +1146,10 @@ function rebindServers() {
 const activeTransfers = new Set();
 function startProxyServer() {
     const proxy = http.createServer(async (req, res) => {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Headers", "*");
+        res.setHeader("Access-Control-Allow-Private-Network", "true");
+        if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
         if (guardAdmin(req, res)) return;
         // "Zastaviť server" in the UI now stops streaming too, not just the addon handlers
         const isStreamReq = /^\/(proxy|fsproxy|ptproxy|wsproxy)\//.test(req.url);
@@ -2608,10 +2612,11 @@ const addonInterfaces = {
 
 function startAddonServer() {
     const server = http.createServer(async (req, res) => {
-        if (guardAdmin(req, res)) return;
         res.setHeader("Access-Control-Allow-Origin", "*");
         res.setHeader("Access-Control-Allow-Headers", "*");
+        res.setHeader("Access-Control-Allow-Private-Network", "true");
         if (req.method === "OPTIONS") { res.writeHead(200); res.end(); return; }
+        if (guardAdmin(req, res)) return;
 
         const url = req.url.replace(/\?.*$/, "");
 
