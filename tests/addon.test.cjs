@@ -106,16 +106,21 @@ check('Generated configuration JavaScript parses and passwords are not trimmed',
     assert.ok(!/Password"\)\.value\.trim/.test(script));
     assert.ok(html.includes('lanHostSelect'));new vm.Script(f.run('pairingHTML()').match(/<script>([\s\S]*?)<\/script>/)[1]);
 });
-check('Android install uses an HTTPS manifest without writing to the Stremio account',f=>{
+check('Android install stays local without tunnels or Stremio account writes',f=>{
     const html=f.run('getConfigHTML()');
     const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
     const install=script.match(/async function installOne\(key\) \{[\s\S]*?\n\}/)[0];
-    assert.ok(install.includes('/api/install-url?key='));
+    assert.ok(install.includes('addonUrls[key]'));
+    assert.ok(install.includes('stremio:///addons?addon='));
+    assert.ok(install.includes('encodeURIComponent(url)'));
+    assert.ok(!install.includes('url.replace'));
     assert.ok(!install.includes('accountInstall'));
-    assert.ok(f.run('typeof ensureInstallTunnel'), 'function');
-    assert.equal(f.run('extractInstallTunnelUrl("INF https://quiet-river-42.trycloudflare.com ready")'), 'https://quiet-river-42.trycloudflare.com');
-    assert.ok(source.includes('"tunnel", "--url"'));
-    assert.ok(!source.includes('api.trycloudflare.com/tunnel'));
+    assert.ok(source.includes('http://127.0.0.1:${ADDON_PORT}/st/manifest.json'));
+    assert.ok(!source.toLowerCase().includes('cloudflared'));
+    assert.ok(!source.includes('/api/install-url'));
+    assert.ok(!source.includes('/api/stremio/install'));
+    assert.ok(!source.includes('addonCollectionSet'));
+    assert.ok(!source.includes('stremioTitle'));
 });
 check('OTA rejects invalid syntax without replacing the installed addon',async f=>{
     fs.writeFileSync(path.join(f.dir,'addon.js'),'original');

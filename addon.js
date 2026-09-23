@@ -6,7 +6,6 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { spawn } = require("child_process");
 
 const BASE_URL = "https://www.sledujteto.cz";
 const API_URL = `${BASE_URL}/api/web`;
@@ -31,7 +30,7 @@ const CONFIG_PATH = persistentPath("config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 38;
+const APP_VERSION = 39;
 const RELEASE_VERSION = "2.5.2";
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
@@ -45,7 +44,6 @@ const NATIVE_VERSION = parseInt(process.argv[2]) || 0;
 // Version NAME shown to the user (e.g. "1.3"). The wrapper passes it as
 // process.argv[3] - Android: versionName, PC: the desktop app version.
 const NATIVE_VERSION_NAME = process.argv[3] || "";
-const CLOUDFLARED_BIN = process.argv[4] || process.env.STREAMHUB_CLOUDFLARED || "";
 
 // ============ CONFIG ============
 
@@ -53,7 +51,7 @@ const CLOUDFLARED_BIN = process.argv[4] || process.env.STREAMHUB_CLOUDFLARED || 
 // This is not real encryption - it only prevents casual plaintext reading.
 const SECRET_KEY = "StreamHub-cfg-v1";
 const ENC_PREFIX = "enc1:";
-const PASSWORD_KEYS = ["stPassword", "fsPassword", "wsPassword", "ptPassword", "stremioAuthKey"];
+const PASSWORD_KEYS = ["stPassword", "fsPassword", "wsPassword", "ptPassword"];
 
 function xorBytes(buf) {
     const out = Buffer.alloc(buf.length);
@@ -1143,172 +1141,6 @@ function rebindServers() {
     return Promise.all([rebind(proxyServer, PROXY_PORT, "PROXY"), rebind(addonServer, ADDON_PORT, "ADDON")]);
 }
 
-// ============ STREMIO ACCOUNT API ============
-// Installs the addons straight into the user's Stremio account via the
-// official sync API (addonCollectionSet). Stremio blocks adding http://
-// addons from a non-localhost URL through the normal "Add" flow, but the
-// account sync API accepts them - and the collection then syncs to every
-// device logged into that account (phone, Android TV...).
-const STREMIO_API = "https://api.strem.io";
-
-async function stremioApi(method, params) {
-    const r = await axios.post(`${STREMIO_API}/api/${method}`, JSON.stringify(params), {
-        headers: { "Content-Type": "application/json" }, timeout: 15000, validateStatus: () => true,
-    });
-    const body = typeof r.data === "string" ? JSON.parse(r.data) : r.data;
-    if (!body || body.error) throw new Error((body && body.error && (body.error.message || body.error)) || `HTTP ${r.status}`);
-    return body.result;
-}
-
-async function stremioLogin(email, password) {
-    const result = await stremioApi("login", { email, password });
-    if (!result || !result.authKey) throw new Error("no authKey");
-    return result.authKey;
-}
-
-// Verify an authKey by fetching the collection; returns the addon list.
-async function stremioGetAddons(authKey) {
-    const coll = await stremioApi("addonCollectionGet", { authKey, update: true });
-    return (coll && coll.addons) || [];
-}
-
-// Which of our addons are already in the account for the given host.
-// Cached briefly so the /configure status poll doesn't hammer the Stremio API.
-let installedCache = { ts: 0, host: "", keys: [] };
-async function stremioInstalledKeys(authKey, host) {
-    if (Date.now() - installedCache.ts < 20000 && installedCache.host === host) return installedCache.keys;
-    const addons = await stremioGetAddons(authKey);
-    const keys = [];
-    for (const k of ["st", "fs", "hs", "ws", "pt"]) {
-        const re = new RegExp(`//${host.replace(/\./g, "\\.")}:${ADDON_PORT}/${k}/manifest\\.json$`);
-        if (addons.some(a => re.test((a && a.transportUrl) || ""))) keys.push(k);
-    }
-    installedCache = { ts: Date.now(), host, keys };
-    return keys;
-}
-
-// Push selected Stream Hub addons (LAN URLs) into the account, replacing any
-// previous Stream Hub entries so re-installing doesn't create duplicates.
-let accountWrite = Promise.resolve();
-function stremioInstall(authKey, host, keys) {
-    const job = accountWrite.then(() => stremioInstallRaw(authKey, host, keys));
-    accountWrite = job.catch(() => {});
-    return job;
-}
-async function stremioInstallRaw(authKey, host, keys) {
-    let addons = await stremioGetAddons(authKey);
-    // Only remove the addons we're about to (re)install, so adding one addon
-    // does not wipe the others already in the account.
-    const replacing = (a) => keys.some(k => new RegExp(`:${ADDON_PORT}/${k}/manifest\\.json$`).test((a && a.transportUrl) || ""));
-    addons = addons.filter(a => !replacing(a));
-    for (const key of keys) {
-        const iface = addonInterfaces[key];
-        if (!iface) continue;
-        addons.push({
-            transportUrl: `http://${host}:${ADDON_PORT}/${key}/manifest.json`,
-            transportName: "",
-            manifest: iface.manifest,
-            flags: { official: false, protected: false },
-        });
-    }
-    await stremioApi("addonCollectionSet", { authKey, addons });
-    installedCache.ts = 0; // force a refresh of the installed-keys list
-    return keys.length;
-}
-
-// ============ ANDROID INSTALL TUNNEL ============
-// Stremio's Android UI refuses to fetch local HTTP manifests. This temporary
-// HTTPS origin is used only for opening the manifest, never for account writes.
-let installTunnelUrl = "";
-let installTunnelProcess = null;
-let installTunnelStart = null;
-
-function extractInstallTunnelUrl(output) {
-    const match = String(output).match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-    return match ? match[0] : "";
-}
-
-async function waitForInstallManifest(key, timeoutMs = 90000) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && installTunnelUrl) {
-        try {
-            const response = await axios.get(`${installTunnelUrl}/${key}/manifest.json`, {
-                timeout: 8000,
-                validateStatus: () => true,
-            });
-            if (response.status === 200) return true;
-        } catch (error) {}
-        await new Promise(resolve => setTimeout(resolve, 3000));
-    }
-    return false;
-}
-
-async function ensureInstallTunnel(key) {
-    if (!CLOUDFLARED_BIN || !fs.existsSync(CLOUDFLARED_BIN)) {
-        throw new Error("HTTPS tunnel is not available on this device");
-    }
-    if (installTunnelUrl && await waitForInstallManifest(key, 12000)) return installTunnelUrl;
-    if (installTunnelStart) {
-        await installTunnelStart;
-        if (await waitForInstallManifest(key, 30000)) return installTunnelUrl;
-        throw new Error("HTTPS tunnel did not become ready");
-    }
-
-    installTunnelStart = (async () => {
-        const args = [
-            "tunnel", "--url", `http://127.0.0.1:${ADDON_PORT}`,
-            "--edge-ip-version", "4", "--no-autoupdate",
-        ];
-        installTunnelProcess = spawn(CLOUDFLARED_BIN, args, {
-            cwd: DATA_DIR,
-            stdio: ["ignore", "pipe", "pipe"],
-        });
-
-        await new Promise((resolve, reject) => {
-            let settled = false;
-            let recentOutput = "";
-            const finish = (error, url) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                if (error) reject(error);
-                else { installTunnelUrl = url; resolve(); }
-            };
-            const onOutput = chunk => {
-                recentOutput = (recentOutput + chunk.toString()).slice(-8000);
-                const url = extractInstallTunnelUrl(recentOutput);
-                if (url) finish(null, url);
-            };
-            const timer = setTimeout(() => {
-                const detail = recentOutput.split(/\r?\n/).filter(Boolean).slice(-1)[0] || "no URL received";
-                finish(new Error(`HTTPS tunnel startup failed: ${detail}`));
-            }, 45000);
-            installTunnelProcess.stdout.on("data", onOutput);
-            installTunnelProcess.stderr.on("data", onOutput);
-            installTunnelProcess.once("error", error => finish(error));
-            installTunnelProcess.once("exit", code => finish(new Error(`HTTPS tunnel exited (${code})`)));
-        });
-
-        installTunnelProcess.on("exit", code => {
-            console.log("[INSTALL TUNNEL] exited:", code);
-            installTunnelProcess = null;
-            installTunnelUrl = "";
-        });
-        console.log("[INSTALL TUNNEL] URL:", installTunnelUrl);
-        if (!await waitForInstallManifest(key)) {
-            installTunnelProcess.kill();
-            throw new Error("HTTPS tunnel did not become ready");
-        }
-    })();
-
-    try {
-        await installTunnelStart;
-        return installTunnelUrl;
-    } finally {
-        installTunnelStart = null;
-    }
-}
-
 // ============ PROXY ============
 
 const activeTransfers = new Set();
@@ -1426,7 +1258,6 @@ function startProxyServer() {
                 lanMode: !!config.lanMode,
                 lanIps: getLanIps(),
                 lanHost: getLanHost(),
-                stremio: { loggedIn: !!config.stremioAuthKey, user: config.stremioUser || "" },
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
                 fs: { loggedIn: fsLoggedIn, unlimited: fsUnlimited, user: fsUser },
                 ws: { loggedIn: wsLoggedIn, vip: wsVip, user: wsUser },
@@ -1441,22 +1272,6 @@ function startProxyServer() {
             };
             res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
             res.end(rewriteLocalUrls(JSON.stringify(status), req));
-            return;
-        }
-
-        // Android installation: return a live HTTPS manifest URL without
-        // logging in to Stremio or modifying the user's addon collection.
-        if (req.url.startsWith("/api/install-url")) {
-            res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-            try {
-                const key = new URL(req.url, "http://127.0.0.1").searchParams.get("key");
-                if (!["st", "fs", "hs", "ws", "pt"].includes(key)) throw new Error("Invalid addon");
-                const origin = await ensureInstallTunnel(key);
-                res.end(JSON.stringify({ ok: true, url: `${origin}/${key}/manifest.json` }));
-            } catch (error) {
-                console.error("[INSTALL TUNNEL]", error.message);
-                res.end(JSON.stringify({ ok: false, error: error.message }));
-            }
             return;
         }
 
@@ -1477,81 +1292,6 @@ function startProxyServer() {
                     setTimeout(() => rebindServers().catch(e => console.error("[LAN] Rebind error:", e.message)), 500);
                 } catch (e) {
                     res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                    res.end(JSON.stringify({ ok: false, error: e.message }));
-                }
-            });
-            return;
-        }
-
-        // ---- STREMIO ACCOUNT: login (email+password -> authKey) ----
-        if (req.url === "/api/stremio/login" && req.method === "POST") {
-            let body = "";
-            req.on("data", c => body += c);
-            req.on("end", async () => {
-                try {
-                    const { email, password, authKey } = JSON.parse(body);
-                    let key = authKey;
-                    if (!key) key = await stremioLogin(email, password);
-                    await stremioGetAddons(key); // verify the key works
-                    config.stremioAuthKey = key;
-                    config.stremioUser = email || "authKey";
-                    saveConfig(config);
-                    console.log(`[STREMIO] Logged in as ${config.stremioUser}`);
-                    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                    res.end(JSON.stringify({ ok: true, user: config.stremioUser }));
-                } catch (e) {
-                    console.error("[STREMIO] Login error:", e.message);
-                    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                    res.end(JSON.stringify({ ok: false, error: e.message }));
-                }
-            });
-            return;
-        }
-
-        // ---- STREMIO ACCOUNT: logout ----
-        if (req.url === "/api/stremio/logout" && req.method === "POST") {
-            delete config.stremioAuthKey; delete config.stremioUser; saveConfig(config);
-            installedCache = { ts: 0, host: "", keys: [] };
-            res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-            res.end(JSON.stringify({ ok: true }));
-            return;
-        }
-
-        // ---- STREMIO ACCOUNT: which of our addons are already in the account ----
-        if (req.url.split("?")[0] === "/api/stremio/installed") {
-            res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-            try {
-                if (/[?&]fresh=1/.test(req.url)) installedCache.ts = 0; // pull-to-refresh forces a live check
-                if (!config.stremioAuthKey) { res.end(JSON.stringify({ ok: true, keys: [] })); return; }
-                const ips = getLanIps();
-                const host = getLanHost();
-                const keys = await stremioInstalledKeys(config.stremioAuthKey, host);
-                res.end(JSON.stringify({ ok: true, keys }));
-            } catch (e) {
-                res.end(JSON.stringify({ ok: false, keys: [], error: e.message }));
-            }
-            return;
-        }
-
-        // ---- STREMIO ACCOUNT: install addons into the account ----
-        if (req.url === "/api/stremio/install" && req.method === "POST") {
-            let body = "";
-            req.on("data", c => body += c);
-            req.on("end", async () => {
-                try {
-                    if (!config.stremioAuthKey) throw new Error("not logged in");
-                    const parsed = body ? JSON.parse(body) : {};
-                    const keys = (parsed.keys && parsed.keys.length) ? parsed.keys : ["st", "fs", "hs", "ws", "pt"];
-                    // Use the LAN IP so remote devices (phone, TV) can reach the server.
-                    const ips = getLanIps();
-                    const host = getLanHost();
-                    const count = await stremioInstall(config.stremioAuthKey, host, keys);
-                    console.log(`[STREMIO] Installed ${count} addons into account (host ${host})`);
-                    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                    res.end(JSON.stringify({ ok: true, count, host, lanMode: !!config.lanMode }));
-                } catch (e) {
-                    console.error("[STREMIO] Install error:", e.message);
-                    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                     res.end(JSON.stringify({ ok: false, error: e.message }));
                 }
             });
@@ -2050,18 +1790,6 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
     </div>
 
     <details style="margin:12px 0"><summary>Kód pre správu zo siete</summary><code style="overflow-wrap:anywhere">${config.adminToken}</code></details>
-    <div class="login-panel open" id="stremioBox" style="animation:none;">
-        <div class="panel-title" id="stremioTitle">Inštalovať do Stremio účtu</div>
-        <input type="text" id="stremioEmail" placeholder="Stremio email">
-        <input type="password" id="stremioPassword" placeholder="Heslo (alebo authKey nižšie)">
-        <input type="text" id="stremioAuthKey" placeholder="authKey (voliteľné)">
-        <div class="panel-actions">
-            <button class="btn-login" id="stremioLoginBtn" onclick="stremioLoginAction()">Prihlásiť</button>
-            <button class="btn-logout-sm hidden" id="stremioLogoutBtn" onclick="stremioLogoutAction()">Odhlásiť</button>
-        </div>
-        <div id="stremioMsg" style="font-size:11px; margin-top:8px; line-height:1.5;"></div>
-        <span id="stremioSpinner" class="spinner hidden"></span>
-    </div>
 </div>
 
 <script>
@@ -2112,13 +1840,6 @@ const T = {
         lanTitle: "Prístup zo siete (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnúť", lanDisable: "Vypnúť",
         lanWarn: "Server bude dostupný pre všetky zariadenia v sieti.",
-        strTitle: "Inštalovať do Stremio účtu",
-        strHelp: "Prihlás sa do svojho Stremio účtu – doplnky sa zapíšu priamo do účtu a nasynchronizujú na telefón aj TV (obíde to blokovanie http). Zapni najprv „Prístup zo siete“.",
-        installed: "Nainštalované", strAddOne: "Do účtu", strInstalling: "Pridávam...",
-        strInstalled: "Hotovo – pridané do účtu. Otvor Stremio na TV/telefóne.",
-        strUseCards: "Tlačidlo „Pridať“ teraz pridáva doplnky priamo do Stremio účtu.",
-        strNeedLan: "Najprv zapni „Prístup zo siete (LAN)“.",
-        strLoggedIn: "Prihlásený", strFillLogin: "Zadaj email a heslo alebo authKey",
     },
     cz: {
         serverStopped: "Server zastaven", serverRunning: "Server běží", serverUnavailable: "Server nedostupný",
@@ -2141,13 +1862,6 @@ const T = {
         lanTitle: "Přístup ze sítě (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnout", lanDisable: "Vypnout",
         lanWarn: "Server bude dostupný pro všechna zařízení v síti.",
-        strTitle: "Instalovat do Stremio účtu",
-        strHelp: "Přihlas se do svého Stremio účtu – doplňky se zapíšou přímo do účtu a nasynchronizují na telefon i TV (obejde to blokování http). Zapni nejdřív „Přístup ze sítě“.",
-        installed: "Nainstalováno", strAddOne: "Do účtu", strInstalling: "Přidávám...",
-        strInstalled: "Hotovo – přidáno do účtu. Otevři Stremio na TV/telefonu.",
-        strUseCards: "Tlačítko „Přidat“ teď přidává doplňky přímo do Stremio účtu.",
-        strNeedLan: "Nejdřív zapni „Přístup ze sítě (LAN)“.",
-        strLoggedIn: "Přihlášen", strFillLogin: "Zadej email a heslo nebo authKey",
     },
     en: {
         serverStopped: "Server stopped", serverRunning: "Server running", serverUnavailable: "Server unavailable",
@@ -2170,13 +1884,6 @@ const T = {
         lanTitle: "Network access (LAN)", lanOn: "Enabled", lanOff: "Disabled",
         lanEnable: "Enable", lanDisable: "Disable",
         lanWarn: "The server will be reachable by every device on the network.",
-        strTitle: "Install into Stremio account",
-        strHelp: "Sign in to your Stremio account - the addons are written straight into the account and sync to your phone and TV (this bypasses the http block). Turn on Network access first.",
-        installed: "Installed", strAddOne: "To account", strInstalling: "Adding...",
-        strInstalled: "Done - added to your account. Open Stremio on your TV/phone.",
-        strUseCards: "The Add button now adds addons straight into your Stremio account.",
-        strNeedLan: "Turn on Network access (LAN) first.",
-        strLoggedIn: "Signed in", strFillLogin: "Enter email and password or authKey",
     }
 };
 let lang = localStorage.getItem("lang") || "sk";
@@ -2232,16 +1939,14 @@ function applyStrings() {
     document.getElementById("updTitle").textContent = t("updTitle");
     renderUpdateUI(); // re-render status + button in the current language
 
-    // LAN + Stremio account panel
+    // LAN panel
     document.getElementById("lanTitle").textContent = t("lanTitle");
-    document.getElementById("stremioTitle").textContent = t("strTitle");
     renderLanUI();
 }
 
 // ---- LAN mode ----
 let lanMode = false;
 let lanIps = [];
-let stremioLoggedIn = false;
 
 function renderLanUI() {
     document.getElementById("lanStatus").textContent = lanMode ? t("lanOn") : t("lanOff");
@@ -2249,31 +1954,13 @@ function renderLanUI() {
     document.getElementById("lanBtn").textContent = lanMode ? t("lanDisable") : t("lanEnable");
 }
 
-// The Add button keeps its label/colour. In account mode (LAN + Stremio
-// signed in) it installs into the account; if the addon is already in the
-// account it shows "Nainštalované" instead.
-let installedKeys = [];
-async function refreshInstalled(force) {
-    try {
-        const r = await fetch(API + "/api/stremio/installed" + (force ? "?fresh=1" : ""));
-        const j = await r.json();
-        installedKeys = (j && j.keys) || [];
-    } catch (e) { /* keep previous */ }
-}
 function updateAddButtons() {
-    const account = lanMode && stremioLoggedIn;
     ["hs", "pt", "st", "fs", "ws"].forEach(k => {
         const b = document.querySelector("#card-" + k + " .btn-add");
         if (!b) return;
-        if (account && installedKeys.indexOf(k) !== -1) {
-            b.textContent = t("installed");
-            b.classList.add("btn-installed");
-            b.disabled = true;
-        } else {
-            b.textContent = t("add");
-            b.classList.remove("btn-installed");
-            b.disabled = false;
-        }
+        b.textContent = t("add");
+        b.classList.remove("btn-installed");
+        b.disabled = false;
     });
 }
 
@@ -2286,64 +1973,6 @@ async function lanToggle() {
     btn.disabled = true;
     try { await fetch(API + "/api/lan", { method: "POST", body: JSON.stringify({ enabled: !lanMode }) }); } catch (e) {}
     setTimeout(async () => { await loadStatus(); btn.disabled = false; }, 1500);
-}
-
-// ---- Stremio account install ----
-async function stremioLoginAction() {
-    const email = document.getElementById("stremioEmail").value.trim();
-    const pw = document.getElementById("stremioPassword").value;
-    const authKey = document.getElementById("stremioAuthKey").value.trim();
-    if (!authKey && (!email || !pw)) return alert(t("strFillLogin"));
-    const spin = document.getElementById("stremioSpinner");
-    spin.classList.remove("hidden");
-    document.getElementById("stremioLoginBtn").disabled = true;
-    try {
-        const r = await fetch(API + "/api/stremio/login", { method: "POST", body: JSON.stringify({ email, password: pw, authKey }) });
-        const j = await r.json();
-        if (j.ok) {
-            document.getElementById("stremioPassword").value = "";
-            document.getElementById("stremioAuthKey").value = "";
-            await loadStatus();
-        } else {
-            document.getElementById("stremioMsg").textContent = t("loginFailed") + (j.error ? ": " + j.error : "");
-            document.getElementById("stremioMsg").style.color = "#f87171";
-        }
-    } catch (e) {
-        document.getElementById("stremioMsg").textContent = t("error") + ": " + e.message;
-        document.getElementById("stremioMsg").style.color = "#f87171";
-    }
-    spin.classList.add("hidden");
-    document.getElementById("stremioLoginBtn").disabled = false;
-}
-
-async function stremioLogoutAction() {
-    await fetch(API + "/api/stremio/logout", { method: "POST" });
-    document.getElementById("stremioEmail").value = "";
-    document.getElementById("stremioMsg").textContent = "";
-    await loadStatus();
-}
-
-// Install a single addon straight into the Stremio account. Runs from the
-// "Pridať" (Add) button when LAN mode is on AND the Stremio account is signed
-// in - otherwise the Add button falls back to the local stremio:// link.
-async function accountInstall(key) {
-    const btn = document.querySelector("#card-" + key + " .btn-add");
-    const original = btn ? btn.textContent : "";
-    if (btn) { btn.disabled = true; btn.textContent = "..."; }
-    try {
-        const r = await fetch(API + "/api/stremio/install", { method: "POST", body: JSON.stringify({ keys: [key] }) });
-        const j = await r.json();
-        if (j.ok) {
-            if (btn) btn.textContent = "✓";
-            await refreshInstalled();
-            setTimeout(() => { updateAddButtons(); }, 1200);
-            return;
-        }
-        alert(t("error") + (j.error ? ": " + j.error : ""));
-    } catch (e) {
-        alert(t("error") + ": " + e.message);
-    }
-    if (btn) { btn.textContent = original; btn.disabled = false; }
 }
 
 function togglePanel(key) {
@@ -2371,31 +2000,12 @@ async function loadStatus(force) {
         const s = await r.json();
         addonUrls = s.addons || {};
 
-        // LAN + Stremio account
+        // Optional LAN access for other devices on the same Wi-Fi.
         lanMode = !!s.lanMode;
         lanIps = s.lanIps || [];
         const hostSelect = document.getElementById("lanHostSelect");
         hostSelect.replaceChildren(...lanIps.map(ip => { const option = document.createElement("option"); option.value = ip; option.textContent = ip; option.selected = ip === s.lanHost; return option; }));
         renderLanUI();
-        stremioLoggedIn = !!(s.stremio && s.stremio.loggedIn);
-        const strMsg = document.getElementById("stremioMsg");
-        if (stremioLoggedIn) {
-            document.getElementById("stremioEmail").value = (s.stremio.user || "");
-            document.getElementById("stremioLoginBtn").classList.add("hidden");
-            document.getElementById("stremioLogoutBtn").classList.remove("hidden");
-            document.getElementById("stremioPassword").classList.add("hidden");
-            document.getElementById("stremioAuthKey").classList.add("hidden");
-            // Per-addon install works only with LAN on; guide the user otherwise
-            if (!lanMode) { strMsg.style.color = "#fbbf24"; strMsg.textContent = t("strNeedLan"); }
-            else if (!strMsg.dataset.keep) { strMsg.textContent = ""; }
-        } else {
-            document.getElementById("stremioLoginBtn").classList.remove("hidden");
-            document.getElementById("stremioLogoutBtn").classList.add("hidden");
-            document.getElementById("stremioPassword").classList.remove("hidden");
-            document.getElementById("stremioAuthKey").classList.remove("hidden");
-        }
-        // Detect which addons are already in the account (shows "Nainštalované")
-        if (lanMode && stremioLoggedIn) { await refreshInstalled(force); } else { installedKeys = []; }
         updateAddButtons();
 
         const running = s.serverRunning;
@@ -2556,16 +2166,10 @@ async function installOne(key) {
     const original = button ? button.textContent : "";
     if (button) { button.disabled = true; button.textContent = "..."; }
     try {
-        let url = addonUrls[key];
-        if (isAndroid) {
-            const response = await fetch(API + "/api/install-url?key=" + encodeURIComponent(key));
-            const result = await response.json();
-            if (!result.ok || !result.url) throw new Error(result.error || "HTTPS manifest unavailable");
-            url = result.url;
-        }
+        const url = addonUrls[key];
         if (!url) return;
         if (navigator.clipboard) navigator.clipboard.writeText(url).catch(() => {});
-        window.open("stremio://" + url.replace(/^https?:\\/\\//, ""), "_blank");
+        window.open("stremio:///addons?addon=" + encodeURIComponent(url), "_blank");
     } catch (error) {
         alert(t("error") + ": " + error.message);
     } finally {

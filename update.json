@@ -1,8 +1,8 @@
 {
-  "version": 38,
+  "version": 39,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/fix/v2.5.1/addon.js",
-  "sha256": "b338ae7c4712a383156e0cf3ebe78b2cf9dd3ef2cf67629e7459ea4313d97717",
-  "notes": "v2.5.2: oprava Android HTTPS instalacie; quick tunnel teraz registruje priamo cloudflared bez chyby 400 a bez zapisu do Stremio uctu",
-  "apkVersion": 37,
+  "sha256": "42cc795fa84272ab66af62bb06251db15d800da5f7c84da4a1dc04a7619d9973",
+  "notes": "v2.5.2: addon bezi iba lokalne na zariadeni cez 127.0.0.1; odstraneny Cloudflare tunnel aj zapis do Stremio uctu",
+  "apkVersion": 39,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/download/v2.5.2/stream-hub.apk"
 }
