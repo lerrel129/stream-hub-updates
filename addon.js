@@ -6,8 +6,6 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const dns = require("dns");
-const https = require("https");
 const { spawn } = require("child_process");
 
 const BASE_URL = "https://www.sledujteto.cz";
@@ -33,7 +31,7 @@ const CONFIG_PATH = persistentPath("config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 37;
+const APP_VERSION = 38;
 const RELEASE_VERSION = "2.5.2";
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
@@ -1225,28 +1223,9 @@ let installTunnelUrl = "";
 let installTunnelProcess = null;
 let installTunnelStart = null;
 
-const INSTALL_TUNNEL_EDGES = [
-    "198.41.192.7", "198.41.192.47", "198.41.192.107", "198.41.192.227",
-    "198.41.200.13", "198.41.200.53", "198.41.200.113", "198.41.200.193",
-];
-
-function resolve4(host) {
-    return new Promise(resolve => {
-        const timer = setTimeout(() => resolve([]), 4000);
-        dns.resolve4(host, (error, addresses) => {
-            clearTimeout(timer);
-            resolve(!error && addresses ? addresses : []);
-        });
-    });
-}
-
-async function resolveTunnelEdges() {
-    let addresses = [];
-    for (const host of ["region1.v2.argotunnel.com", "region2.v2.argotunnel.com"]) {
-        addresses.push(...(await resolve4(host)).slice(0, 2));
-    }
-    if (!addresses.length) addresses = INSTALL_TUNNEL_EDGES;
-    return [...new Set(addresses)].slice(0, 8).map(address => `${address}:7844`);
+function extractInstallTunnelUrl(output) {
+    const match = String(output).match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
+    return match ? match[0] : "";
 }
 
 async function waitForInstallManifest(key, timeoutMs = 90000) {
@@ -1276,44 +1255,50 @@ async function ensureInstallTunnel(key) {
     }
 
     installTunnelStart = (async () => {
-        const registration = await axios.post("https://api.trycloudflare.com/tunnel", "", {
-            headers: { "Content-Type": "application/json" },
-            timeout: 20000,
-            validateStatus: () => true,
-            httpsAgent: new https.Agent({ keepAlive: true }),
+        const args = [
+            "tunnel", "--url", `http://127.0.0.1:${ADDON_PORT}`,
+            "--edge-ip-version", "4", "--no-autoupdate",
+        ];
+        installTunnelProcess = spawn(CLOUDFLARED_BIN, args, {
+            cwd: DATA_DIR,
+            stdio: ["ignore", "pipe", "pipe"],
         });
-        const tunnel = registration.data && registration.data.result;
-        if (!tunnel || !tunnel.hostname) throw new Error(`Tunnel registration failed (${registration.status})`);
 
-        const credentials = persistentPath("install-tunnel-credentials.json");
-        const configuration = persistentPath("install-tunnel-config.yml");
-        fs.writeFileSync(credentials, JSON.stringify({
-            AccountTag: tunnel.account_tag,
-            TunnelID: tunnel.id,
-            TunnelSecret: tunnel.secret,
-        }));
-        fs.writeFileSync(configuration,
-            `tunnel: ${tunnel.id}\ncredentials-file: ${credentials}\ningress:\n` +
-            `  - hostname: ${tunnel.hostname}\n    service: http://127.0.0.1:${ADDON_PORT}\n` +
-            "  - service: http_status:404\n");
-
-        const args = ["tunnel", "--config", configuration, "--edge-ip-version", "4", "--no-autoupdate"];
-        for (const edge of await resolveTunnelEdges()) args.push("--edge", edge);
-        args.push("run", tunnel.id);
-        installTunnelProcess = spawn(CLOUDFLARED_BIN, args, { cwd: DATA_DIR });
-        installTunnelProcess.on("error", error => {
-            console.error("[INSTALL TUNNEL] spawn error:", error.message);
-            installTunnelProcess = null;
-            installTunnelUrl = "";
+        await new Promise((resolve, reject) => {
+            let settled = false;
+            let recentOutput = "";
+            const finish = (error, url) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                if (error) reject(error);
+                else { installTunnelUrl = url; resolve(); }
+            };
+            const onOutput = chunk => {
+                recentOutput = (recentOutput + chunk.toString()).slice(-8000);
+                const url = extractInstallTunnelUrl(recentOutput);
+                if (url) finish(null, url);
+            };
+            const timer = setTimeout(() => {
+                const detail = recentOutput.split(/\r?\n/).filter(Boolean).slice(-1)[0] || "no URL received";
+                finish(new Error(`HTTPS tunnel startup failed: ${detail}`));
+            }, 45000);
+            installTunnelProcess.stdout.on("data", onOutput);
+            installTunnelProcess.stderr.on("data", onOutput);
+            installTunnelProcess.once("error", error => finish(error));
+            installTunnelProcess.once("exit", code => finish(new Error(`HTTPS tunnel exited (${code})`)));
         });
+
         installTunnelProcess.on("exit", code => {
             console.log("[INSTALL TUNNEL] exited:", code);
             installTunnelProcess = null;
             installTunnelUrl = "";
         });
-        installTunnelUrl = `https://${tunnel.hostname}`;
         console.log("[INSTALL TUNNEL] URL:", installTunnelUrl);
-        if (!await waitForInstallManifest(key)) throw new Error("HTTPS tunnel did not become ready");
+        if (!await waitForInstallManifest(key)) {
+            installTunnelProcess.kill();
+            throw new Error("HTTPS tunnel did not become ready");
+        }
     })();
 
     try {

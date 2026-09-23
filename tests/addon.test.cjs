@@ -113,6 +113,9 @@ check('Android install uses an HTTPS manifest without writing to the Stremio acc
     assert.ok(install.includes('/api/install-url?key='));
     assert.ok(!install.includes('accountInstall'));
     assert.ok(f.run('typeof ensureInstallTunnel'), 'function');
+    assert.equal(f.run('extractInstallTunnelUrl("INF https://quiet-river-42.trycloudflare.com ready")'), 'https://quiet-river-42.trycloudflare.com');
+    assert.ok(source.includes('"tunnel", "--url"'));
+    assert.ok(!source.includes('api.trycloudflare.com/tunnel'));
 });
 check('OTA rejects invalid syntax without replacing the installed addon',async f=>{
     fs.writeFileSync(path.join(f.dir,'addon.js'),'original');
