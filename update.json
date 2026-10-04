@@ -1,7 +1,7 @@
 {
   "version": 40,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/fix/v2.5.1/addon.js",
-  "sha256": "b62a18b012ce87568b1ffb3118fe45b01fdb33cfcc4f74f99c6ec2fb7924233a",
+  "sha256": "dbd03541399809a9a294bb477a869558491f0eaa9038a48f2dbe95f5a2b7c73d",
   "notes": "v2.5.2: opraveny lokalny pristup zo Stremia cez Private Network Access; bez tunela a bez zapisu do Stremio uctu",
   "apkVersion": 40,
   "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/download/v2.5.2/stream-hub.apk"
