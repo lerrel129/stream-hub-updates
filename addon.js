@@ -30,8 +30,8 @@ const CONFIG_PATH = persistentPath("config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 40;
-const RELEASE_VERSION = "2.5.2";
+const APP_VERSION = 41;
+const RELEASE_VERSION = "2.5.3";
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/fix/v2.5.1/update.json";
@@ -462,6 +462,37 @@ function detectAudio(name) {
     // bare "dabing" without an explicit language marker usually means CZ
     else if (!tags.length && DABING_RE.test(n)) tags.push("CZ");
     return tags.join(" ");
+}
+
+function parseSizeBytes(value) {
+    if (typeof value === "number") return Number.isFinite(value) && value > 0 ? value : 0;
+    const text = String(value || "").replace(/,/g, ".").trim();
+    const match = text.match(/(\d+(?:\.\d+)?)\s*(B|KB|KIB|MB|MIB|GB|GIB|TB|TIB)\b/i);
+    if (!match) return /^\d+$/.test(text) ? Number(text) : 0;
+    const unit = match[2].toUpperCase();
+    const power = /^(TB|TIB)$/.test(unit) ? 4 : /^(GB|GIB)$/.test(unit) ? 3 : /^(MB|MIB)$/.test(unit) ? 2 : /^(KB|KIB)$/.test(unit) ? 1 : 0;
+    return Number(match[1]) * (1024 ** power);
+}
+
+function sortStreamsByPreference(files) {
+    const preferredLanguage = config.preferLanguage && ["SK", "CZ"].includes(config.preferredLanguage)
+        ? config.preferredLanguage
+        : "";
+    return files.map((file, index) => {
+        const languageText = [file.audioTracks, file.name, file.title, file.description].filter(Boolean).join(" ");
+        return {
+            file,
+            index,
+            size: parseSizeBytes(file.size ?? file.filesize ?? file.description),
+            languages: detectAudio(languageText).split(/\s+/).filter(Boolean),
+        };
+    }).sort((a, b) => {
+        if (preferredLanguage) {
+            const languageOrder = Number(b.languages.includes(preferredLanguage)) - Number(a.languages.includes(preferredLanguage));
+            if (languageOrder) return languageOrder;
+        }
+        return b.size - a.size || a.index - b.index;
+    }).map(entry => entry.file);
 }
 
 // ============ FASTSHARE ============
@@ -1262,6 +1293,10 @@ function startProxyServer() {
                 lanMode: !!config.lanMode,
                 lanIps: getLanIps(),
                 lanHost: getLanHost(),
+                streamPreferences: {
+                    enabled: !!config.preferLanguage,
+                    language: config.preferredLanguage === "CZ" ? "CZ" : "SK",
+                },
                 st: { loggedIn, premium: stPremium, user: config.stEmail || "" },
                 fs: { loggedIn: fsLoggedIn, unlimited: fsUnlimited, user: fsUser },
                 ws: { loggedIn: wsLoggedIn, vip: wsVip, user: wsUser },
@@ -1294,6 +1329,27 @@ function startProxyServer() {
                     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                     res.end(JSON.stringify({ ok: true, lanMode: config.lanMode, lanIps: getLanIps() }));
                     setTimeout(() => rebindServers().catch(e => console.error("[LAN] Rebind error:", e.message)), 500);
+                } catch (e) {
+                    res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
+            return;
+        }
+
+        if (req.url === "/api/stream-preferences" && req.method === "POST") {
+            let body = "";
+            req.on("data", c => body += c);
+            req.on("end", () => {
+                try {
+                    const preference = JSON.parse(body);
+                    const language = String(preference.language || "").toUpperCase();
+                    if (!["SK", "CZ"].includes(language)) throw new Error("Invalid preferred language");
+                    config.preferLanguage = !!preference.enabled;
+                    config.preferredLanguage = language;
+                    saveConfig(config);
+                    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                    res.end(JSON.stringify({ ok: true, enabled: config.preferLanguage, language }));
                 } catch (e) {
                     res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
                     res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -1582,6 +1638,12 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
 .update-btn { padding: 8px 16px; border: none; border-radius: 12px; font-size: 12px; cursor: pointer; font-weight: bold; color: #fff; background: #4a9c4f; transition: background 0.15s; flex-shrink: 0; }
 .update-btn:hover { background: #3d8b40; }
 .update-btn:disabled { opacity: 0.5; cursor: default; }
+#streamPreferences { flex-wrap: wrap; }
+#streamPreferences .update-info { flex: 1; }
+.stream-pref-controls { width: 100%; display: flex; align-items: center; gap: 12px; }
+.stream-pref-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.stream-pref-toggle input { width: 18px; height: 18px; accent-color: #4a9c4f; }
+#preferredLanguage { flex: 1; min-width: 120px; padding: 8px; background: #111827; color: #fff; border: 1px solid #374151; border-radius: 8px; }
 #lanSettings { flex-wrap: wrap; }
 #lanSettings .update-info { flex: 1; }
 #lanHostSelect { width: 100%; padding: 8px; background: #111827; color: #fff; border: 1px solid #374151; border-radius: 8px; }
@@ -1776,6 +1838,19 @@ body { background: #111827; color: #fff; font-family: -apple-system, BlinkMacSys
         <button class="lang-btn" id="lang-cz" onclick="switchLang('cz')">🇨🇿</button>
         <button class="lang-btn" id="lang-en" onclick="switchLang('en')">🇬🇧</button>
     </div>
+    <div class="update-bar" id="streamPreferences">
+        <div class="update-info">
+            <span class="update-title" id="streamPrefTitle">Preferencia streamov</span>
+            <span class="update-status" id="streamPrefStatus">Vypnutá</span>
+        </div>
+        <div class="stream-pref-controls">
+            <label class="stream-pref-toggle"><input type="checkbox" id="preferLanguage" onchange="saveStreamPreferences()"><span id="streamPrefEnable">Uprednostniť jazyk</span></label>
+            <select id="preferredLanguage" aria-label="Preferovaný jazyk" onchange="saveStreamPreferences()">
+                <option value="SK">🇸🇰 Slovenčina</option>
+                <option value="CZ">🇨🇿 Čeština</option>
+            </select>
+        </div>
+    </div>
     <div class="update-bar">
         <div class="update-info">
             <span class="update-title" id="updTitle">Aktualizácia</span>
@@ -1844,6 +1919,9 @@ const T = {
         lanTitle: "Prístup zo siete (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnúť", lanDisable: "Vypnúť",
         lanWarn: "Server bude dostupný pre všetky zariadenia v sieti.",
+        streamPrefTitle: "Preferencia streamov", streamPrefEnable: "Uprednostniť jazyk",
+        streamPrefLanguage: "Preferovaný jazyk", streamPrefOn: "Zapnutá", streamPrefOff: "Vypnutá",
+        streamPrefError: "Nastavenie sa nepodarilo uložiť",
     },
     cz: {
         serverStopped: "Server zastaven", serverRunning: "Server běží", serverUnavailable: "Server nedostupný",
@@ -1866,6 +1944,9 @@ const T = {
         lanTitle: "Přístup ze sítě (LAN)", lanOn: "Zapnutý", lanOff: "Vypnutý",
         lanEnable: "Zapnout", lanDisable: "Vypnout",
         lanWarn: "Server bude dostupný pro všechna zařízení v síti.",
+        streamPrefTitle: "Preference streamů", streamPrefEnable: "Upřednostnit jazyk",
+        streamPrefLanguage: "Preferovaný jazyk", streamPrefOn: "Zapnutá", streamPrefOff: "Vypnutá",
+        streamPrefError: "Nastavení se nepodařilo uložit",
     },
     en: {
         serverStopped: "Server stopped", serverRunning: "Server running", serverUnavailable: "Server unavailable",
@@ -1888,6 +1969,9 @@ const T = {
         lanTitle: "Network access (LAN)", lanOn: "Enabled", lanOff: "Disabled",
         lanEnable: "Enable", lanDisable: "Disable",
         lanWarn: "The server will be reachable by every device on the network.",
+        streamPrefTitle: "Stream preference", streamPrefEnable: "Prefer language",
+        streamPrefLanguage: "Preferred language", streamPrefOn: "Enabled", streamPrefOff: "Disabled",
+        streamPrefError: "Could not save preference",
     }
 };
 let lang = localStorage.getItem("lang") || "sk";
@@ -1946,11 +2030,40 @@ function applyStrings() {
     // LAN panel
     document.getElementById("lanTitle").textContent = t("lanTitle");
     renderLanUI();
+    document.getElementById("streamPrefTitle").textContent = t("streamPrefTitle");
+    document.getElementById("streamPrefEnable").textContent = t("streamPrefEnable");
+    document.getElementById("preferredLanguage").setAttribute("aria-label", t("streamPrefLanguage"));
+    renderStreamPreferences();
 }
 
 // ---- LAN mode ----
 let lanMode = false;
 let lanIps = [];
+let streamPreferences = { enabled: false, language: "SK" };
+
+function renderStreamPreferences() {
+    document.getElementById("preferLanguage").checked = streamPreferences.enabled;
+    document.getElementById("preferredLanguage").value = streamPreferences.language;
+    document.getElementById("preferredLanguage").disabled = !streamPreferences.enabled;
+    document.getElementById("streamPrefStatus").textContent = streamPreferences.enabled ? t("streamPrefOn") : t("streamPrefOff");
+    document.getElementById("streamPrefStatus").style.color = streamPreferences.enabled ? "#34d399" : "#9ca3af";
+}
+
+async function saveStreamPreferences() {
+    const enabled = document.getElementById("preferLanguage").checked;
+    const language = document.getElementById("preferredLanguage").value;
+    try {
+        const response = await fetch(API + "/api/stream-preferences", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled, language }),
+        });
+        if (!response.ok) throw new Error("save failed");
+        streamPreferences = await response.json();
+        renderStreamPreferences();
+    } catch (e) {
+        document.getElementById("streamPrefStatus").textContent = t("streamPrefError");
+    }
+}
 
 function renderLanUI() {
     document.getElementById("lanStatus").textContent = lanMode ? t("lanOn") : t("lanOff");
@@ -2007,6 +2120,8 @@ async function loadStatus(force) {
         // Optional LAN access for other devices on the same Wi-Fi.
         lanMode = !!s.lanMode;
         lanIps = s.lanIps || [];
+        streamPreferences = s.streamPreferences || { enabled: false, language: "SK" };
+        renderStreamPreferences();
         const hostSelect = document.getElementById("lanHostSelect");
         hostSelect.replaceChildren(...lanIps.map(ip => { const option = document.createElement("option"); option.value = ip; option.textContent = ip; option.selected = ip === s.lanHost; return option; }));
         renderLanUI();
@@ -2387,7 +2502,18 @@ stBuilder.defineStreamHandler(async ({ type, id }) => {
         const { imdbId, season, episode } = parseImdbId(id);
         // Resolve the final playback URL only after a stream is selected.
         const results = (await searchStForImdb(imdbId, season, episode)).slice(0, 30);
-        const streams = results.map(item => makeStStream(item.id.replace("sleduj:", ""), imdbId));
+        const streamItems = results.map(item => {
+            const videoId = item.id.replace("sleduj:", "");
+            const file = fileDataCache[videoId] || {};
+            return {
+                ...file,
+                item,
+                videoId,
+                name: file.name || item.name || item.description || "",
+                size: file.filesize ?? file.size ?? item.description ?? "",
+            };
+        });
+        const streams = sortStreamsByPreference(streamItems).map(item => makeStStream(item.videoId, imdbId));
         console.log(`[STREAM] ST ${id}: ${streams.length} streams`);
         return { streams };
     }
@@ -2435,10 +2561,11 @@ fsBuilder.defineStreamHandler(async ({ type, id }) => {
         const { imdbId, season, episode } = parseImdbId(id);
         const results = await searchFsForImdb(imdbId, season, episode);
         enhanceAudioByTitle(results, "name", imdbId);
-        const streams = [];
-        for (const f of results) {
-            streams.push({ url: `http://127.0.0.1:${PROXY_PORT}/fsproxy/${f.fsId}`, name: `${fsLabel()}\n${fsFormatName(f)}`, description: fsFormatDesc(f), behaviorHints: { notWebReady: true } });
-        }
+        const streams = sortStreamsByPreference(results).map(f => ({
+            url: `http://127.0.0.1:${PROXY_PORT}/fsproxy/${f.fsId}`,
+            name: `${fsLabel()}\n${fsFormatName(f)}`, description: fsFormatDesc(f),
+            behaviorHints: { notWebReady: true },
+        }));
         console.log(`[STREAM] FS ${id}: ${streams.length} streams`);
         return { streams };
     }
@@ -2486,10 +2613,9 @@ hsBuilder.defineStreamHandler(async ({ type, id }) => {
         const { imdbId, season, episode } = parseImdbId(id);
         const results = await searchHsForImdb(imdbId, season, episode);
         enhanceAudioByTitle(results, "name", imdbId);
-        const streams = [];
-        for (const f of results) {
-            streams.push({ url: f.downloadUrl, name: `Hellspy.to\n${hsFormatName(f)}`, description: hsFormatDesc(f) });
-        }
+        const streams = sortStreamsByPreference(results).map(f => ({
+            url: f.downloadUrl, name: `Hellspy.to\n${hsFormatName(f)}`, description: hsFormatDesc(f),
+        }));
         console.log(`[STREAM] HS ${id}: ${streams.length} streams`);
         return { streams };
     }
@@ -2539,7 +2665,7 @@ wsBuilder.defineStreamHandler(async ({ type, id }) => {
         enhanceAudioByTitle(results, "name", imdbId);
         // Direct link is resolved lazily via /wsproxy at playback time -
         // no N sequential file_link calls before returning the list.
-        const streams = results.map(f => ({
+        const streams = sortStreamsByPreference(results).map(f => ({
             url: `http://127.0.0.1:${PROXY_PORT}/wsproxy/${encodeURIComponent(f.wsId)}`,
             name: `${wsLabel()}\n${wsFormatName(f)}`, description: wsFormatDesc(f),
             behaviorHints: { notWebReady: true },
@@ -2591,10 +2717,11 @@ ptBuilder.defineStreamHandler(async ({ type, id }) => {
         const { imdbId, season, episode } = parseImdbId(id);
         const results = await searchPtForImdb(imdbId, season, episode);
         enhanceAudioByTitle(results, "name", imdbId);
-        const streams = [];
-        for (const f of results) {
-            streams.push({ url: `http://127.0.0.1:${PROXY_PORT}/ptproxy/${f.ptSlug}/${f.ptId}`, name: `Prehraj.to\n${ptFormatName(f)}`, description: ptFormatDesc(f), behaviorHints: { notWebReady: true } });
-        }
+        const streams = sortStreamsByPreference(results).map(f => ({
+            url: `http://127.0.0.1:${PROXY_PORT}/ptproxy/${f.ptSlug}/${f.ptId}`,
+            name: `Prehraj.to\n${ptFormatName(f)}`, description: ptFormatDesc(f),
+            behaviorHints: { notWebReady: true },
+        }));
         console.log(`[STREAM] PT ${id}: ${streams.length} streams`);
         return { streams };
     }

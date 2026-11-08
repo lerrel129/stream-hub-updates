@@ -46,6 +46,39 @@ check('Film queries include the name without its year; translated names do not i
     const q=await f.run('buildImdbQueries("tt123",null,null)'); assert.ok(q.queries.includes('Movie'));
     assert.equal(f.run('const files=[{name:"Movie EN",audioTracks:""}]; enhanceAudioByTitle(files,"name","tt123"); files[0].audioTracks'), '');
 });
+check('Stream preference groups the chosen language before descending file size', f=>{
+    f.run('config.preferLanguage=true; config.preferredLanguage="SK"');
+    const ordered=JSON.parse(f.run(`JSON.stringify(sortStreamsByPreference([
+        {name:"CZ 20 GB",audioTracks:"CZ",size:"20 GB"},
+        {name:"SK 1.5 GB",audioTracks:"SK",size:"1,5 GB"},
+        {name:"SK 4 GB",audioTracks:"SK",size:"4 GB"},
+        {name:"Unknown size",audioTracks:"SK",size:""}
+    ]).map(file=>file.name))`));
+    assert.deepEqual(ordered,['SK 4 GB','SK 1.5 GB','Unknown size','CZ 20 GB']);
+    f.run('config.preferLanguage=false');
+    const sizeOrdered=JSON.parse(f.run(`JSON.stringify(sortStreamsByPreference([
+        {name:"small",size:"1 GB"},{name:"large",size:"12 GB"}
+    ]).map(file=>file.name))`));
+    assert.deepEqual(sizeOrdered,['large','small']);
+    assert.equal(f.run('parseSizeBytes("1.5 GB")'),1.5*1024**3);
+});
+check('Stream preference API persists the toggle and selected language', async f=>{
+    f.run('startProxyServer()');
+    const request=new PassThrough();
+    request.url='/api/stream-preferences'; request.method='POST';
+    request.headers={host:'127.0.0.1:7515'}; request.socket={remoteAddress:'127.0.0.1'};
+    let status; let responseBody;
+    const completed=new Promise(resolve=>{
+        const response={setHeader(){},writeHead(code){status=code},end(body){responseBody=body;resolve()}};
+        f.servers[0].fn(request,response);
+    });
+    request.end(JSON.stringify({enabled:true,language:'CZ'}));
+    await completed;
+    assert.equal(status,200);
+    assert.deepEqual(JSON.parse(responseBody),{ok:true,enabled:true,language:'CZ'});
+    const saved=JSON.parse(fs.readFileSync(path.join(f.dir,'config.json'),'utf8'));
+    assert.equal(saved.preferLanguage,true); assert.equal(saved.preferredLanguage,'CZ');
+});
 check('Search cache reuses successful results but retries empty responses', async f=>{
     f.run('var searchCalls=0; var successfulSearch=async()=>{searchCalls++;return [{id:"one"}]}; var emptySearch=async()=>{searchCalls++;return []}');
     await f.run('cachedSearch("test","Movie",successfulSearch)');
@@ -118,7 +151,7 @@ check('Stop closes existing transfers',async f=>{
 check('Generated configuration JavaScript parses and passwords are not trimmed',f=>{
     const html=f.run('getConfigHTML()'); const script=html.match(/<script>([\s\S]*?)<\/script>/)[1]; new vm.Script(script);
     assert.ok(!/Password"\)\.value\.trim/.test(script));
-    assert.ok(html.includes('lanHostSelect'));new vm.Script(f.run('pairingHTML()').match(/<script>([\s\S]*?)<\/script>/)[1]);
+    assert.ok(html.includes('lanHostSelect'));assert.ok(html.includes('streamPreferences'));assert.ok(script.includes('/api/stream-preferences'));new vm.Script(f.run('pairingHTML()').match(/<script>([\s\S]*?)<\/script>/)[1]);
 });
 check('Android install stays local without tunnels or Stremio account writes',f=>{
     const html=f.run('getConfigHTML()');
