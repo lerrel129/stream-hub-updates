@@ -30,8 +30,8 @@ const CONFIG_PATH = persistentPath("config.json");
 // ============ OTA UPDATE ============
 // Version of this code. INCREASE this number for every new release
 // (and put the same number into "version" in update.json on GitHub).
-const APP_VERSION = 41;
-const RELEASE_VERSION = "2.5.3";
+const APP_VERSION = 42;
+const RELEASE_VERSION = "2.5.4";
 // Raw link to update.json in the GitHub repo (lerrel129/stream-hub-updates).
 const UPDATE_MANIFEST_URL =
     "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/fix/v2.5.1/update.json";

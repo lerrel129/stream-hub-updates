@@ -1,8 +1,8 @@
 {
-  "version": 41,
+  "version": 42,
   "addonUrl": "https://raw.githubusercontent.com/lerrel129/stream-hub-updates/fix/v2.5.1/addon.js",
-  "sha256": "33cf8af15ae6fccf6ea0a22ebdb1f3e88b52463ec74014e059b575639992ed4f",
-  "notes": "v2.5.3: preferencia jazyka streamov a radenie podla velkosti; lokalne nastavenia bez Stremio uctu",
-  "apkVersion": 41,
-  "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/download/v2.5.3/stream-hub.apk"
+  "sha256": "534e6b27d5ea7aaf2f1969a4fb1540f546215e87a160d2cc6df9c43ee87ac37a",
+  "notes": "v2.5.4: lokalny doplnok sa na Androide otvara v Stremio Web; bez tunela a bez priameho zapisu do Stremio uctu",
+  "apkVersion": 43,
+  "apkUrl": "https://github.com/lerrel129/stream-hub-updates/releases/download/v2.5.4/stream-hub.apk"
 }
